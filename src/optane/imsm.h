@@ -44,7 +44,7 @@ struct ImsmMetadata {
 // Returns nullopt if no `Intel Raid ISM Cfg Sig.` block is found.
 //
 // `hintCacheOffset` is the byte offset of the Intel Cache metadata region if
-// known (e.g. UFS Explorer's "Intel Cache partition" start); passing it avoids
+// known (e.g. a reference tool's "Intel Cache partition" start); passing it avoids
 // a slow full-device scan for the signature.
 std::optional<ImsmMetadata> parseImsm(ImageSource& optane,
                                       uint64_t hintCacheOffset = UINT64_MAX);

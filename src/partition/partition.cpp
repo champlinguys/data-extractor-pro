@@ -85,7 +85,7 @@ std::vector<Partition> scanPartitions(const std::shared_ptr<ImageSource>& img) {
     // table) has an FS boot record at sector 0, which also carries the 0x55AA
     // signature. Detect the common ones by their OEM/signature so we don't
     // mis-parse the VBR's boot code as an MBR partition table. This is exactly
-    // the shape of a UFS Explorer ".dsk" export of a single NTFS volume.
+    // the shape of a raw single-volume image (no partition table).
     bool bareVolume =
         std::memcmp(mbr.data() + 3, "NTFS    ", 8) == 0 ||  // NTFS
         std::memcmp(mbr.data() + 3, "-FVE-FS-", 8) == 0 ||  // BitLocker

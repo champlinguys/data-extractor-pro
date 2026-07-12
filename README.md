@@ -5,6 +5,10 @@ disk image, browse its filesystems in a tree, preview files, and export them —
 including reconstructing **Intel Optane Memory (H10/H20)** volumes from a
 paired QLC-NAND image and Optane-cache image.
 
+> **Recovering data from an Optane laptop?** Follow the plain-English,
+> step-by-step guide in **[RECOVERY.md](RECOVERY.md)** — from making a boot USB
+> to exporting the files.
+
 Status:
 - **NTFS** open → browse → export — working (Qt5 GUI + CLI).
 - **Intel Optane reconstruction (span merge)** — working: merges a QLC + Optane
@@ -16,7 +20,7 @@ Status:
   currently recovered.
 - **BitLocker decryption** — working: recovery password → VMK → FVEK →
   AES-XTS-128, browse/extract the decrypted NTFS. Validated byte-for-byte
-  against UFS Explorer on a real Optane H10 case.
+  against a reference recovery tool on a real Optane H10 case.
 
 HFS+ and ext4 are on the roadmap below.
 
@@ -134,3 +138,7 @@ src/fs/          Filesystem interface, detector, ntfs/
 src/gui/         Qt5 main window + hex view
 src/cli/         headless driver
 ```
+
+## License
+Data Extractor Pro is released under the **GNU General Public License v3.0** —
+see [LICENSE](LICENSE).

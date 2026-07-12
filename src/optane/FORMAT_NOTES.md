@@ -18,7 +18,7 @@ The QLC alone gives a **stale, pre-BitLocker** view. At volume sector 567296
 
 When BitLocker was enabled, the new headers/data were written into the Optane
 write-cache and never flushed back to the QLC. Imaging the QLC by itself loses
-them. The merged view is what UFS Explorer shows as `IntelCache::<device-serial-redacted>`,
+them. The merged view is what a reference recovery tool shows as `IntelCache::<device-serial-redacted>`,
 whose partition 3 is BitLocker (not NTFS).
 
 ## 1. Media geometry
@@ -28,7 +28,7 @@ QLC   qlc.img    512,110,190,592 B = 1,000,215,216 sectors (476.9 GiB)
 Optane optane.img 29,260,513,280 B =    57,149,440 sectors (27.25 GiB)
 ```
 
-UFS Explorer's interpretation of the Optane device:
+a reference tool's interpretation of the Optane device:
 - **Span component partition** — sector 0, 7.25 GB   (holds cached DATA blocks)
 - **Intel Cache partition**    — sector **15206656** (byte 7,785,807,872), 20 GB
   (holds the RST/NV-cache **metadata**, incl. the mapping table)
@@ -95,7 +95,7 @@ Field meanings not yet confirmed (version/counts/flags). The device serial and
 
 ## 2c. The "span component" is a LINEAR copy of the volume start (CONFIRMED)
 
-The Optane device's first **7.25 GB** (UFS's "span component", Optane sectors
+The Optane device's first **7.25 GB** (the reference tool's "span component", Optane sectors
 0 .. 15206656) is a **linear, sector-for-sector image of the BitLocker volume
 starting at its beginning**. Optane byte 0 = BitLocker-partition byte 0.
 
@@ -186,7 +186,7 @@ likely a generation/counter.
 
 Implication: closing this needs a proper index walk (decode the node header +
 child pointers + leaf entry semantics), and is best validated with an external
-per-sector oracle (UFS Explorer's reconstructed volume) rather than more
+per-sector oracle (a reference tool's reconstructed volume) rather than more
 hex-pattern guessing. The three disproven hypotheses above were flat-structure
 assumptions that this multi-level model explains away.
 
@@ -195,7 +195,7 @@ assumptions that this multi-level model explains away.
    The value `0x8ba40` read directly as an Optane sector is high-entropy
    (encrypted) data, not the `-FVE-FS-` header — so `value` is **not** a raw
    Optane sector, or the cache-data area has a non-zero base and/or 4 KiB units.
-2. **How is the cache-data region addressed?** UFS shows a 7.25 GB "span
+2. **How is the cache-data region addressed?** the reference tool shows a 7.25 GB "span
    component" at Optane sector 0 that likely holds the cached data blocks.
    Need the base offset + granularity that turns a `value` into a byte offset.
 3. **Hash/tree structure:** how to look up an arbitrary volume LBA (bucket
@@ -240,7 +240,7 @@ whole problem:
 
 ### Consequence for the tool
 The current **span + QLC reconstruction is already ~99.9 % correct** and matches
-UFS for the vast majority of populated data. Residual defects are < 0.1–0.2 %:
+the reference tool for the vast majority of populated data. Residual defects are < 0.1–0.2 %:
 (a) the ~3 MB span-tail sliver, and (b) rare beyond-span cached clusters
 (recently-written deep files) that live in the Intel Cache region and need the
 hashed index to locate. The records enumerated at the region head (§3) are
