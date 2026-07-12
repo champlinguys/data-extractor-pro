@@ -1,0 +1,74 @@
+name: Release
+
+# Build prebuilt binaries and attach them to a GitHub Release whenever a
+# version tag (e.g. v0.1.0) is pushed. Users can then download and run the
+# AppImage without building anything.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build + packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake qtbase5-dev libssl-dev \
+                                  libfuse2 wget file
+
+      - name: Build (Release)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: Assemble AppDir
+        run: |
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/scalable/apps
+          cp build/data-extractor AppDir/usr/bin/
+          cp build/de-cli         AppDir/usr/bin/
+          cp packaging/data-extractor-pro.desktop \
+             AppDir/usr/share/applications/
+          cp packaging/data-extractor-pro.svg \
+             AppDir/usr/share/icons/hicolor/scalable/apps/
+
+      - name: Build AppImage
+        env:
+          QMAKE: /usr/bin/qmake
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy*.AppImage
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir --plugin qt --output appimage \
+            --desktop-file packaging/data-extractor-pro.desktop \
+            --icon-file packaging/data-extractor-pro.svg
+          mv Data_Extractor_Pro*.AppImage DataExtractorPro-x86_64.AppImage \
+            || mv Data*.AppImage DataExtractorPro-x86_64.AppImage
+
+      - name: Package CLI
+        run: tar czf de-cli-linux-x86_64.tar.gz -C build de-cli
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            DataExtractorPro-x86_64.AppImage
+            de-cli-linux-x86_64.tar.gz
+          body: |
+            Prebuilt binaries for Linux x86_64.
+
+            - **DataExtractorPro-x86_64.AppImage** - the GUI. Download, then:
+              `chmod +x DataExtractorPro-x86_64.AppImage && ./DataExtractorPro-x86_64.AppImage`
+              (Qt and OpenSSL are bundled; no dependencies to install.)
+            - **de-cli-linux-x86_64.tar.gz** - the headless command-line tool.
+
+            See RECOVERY.md for the full imaging-to-export walkthrough.

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="52" fill="#1E2125"/>
+  <!-- disk platter -->
+  <g fill="none" stroke="#3D8BFD" stroke-width="11" stroke-linejoin="round">
+    <ellipse cx="108" cy="92" rx="58" ry="25"/>
+    <path d="M50 92 v44 a58 25 0 0 0 116 0 v-44"/>
+    <path d="M50 114 a58 25 0 0 0 116 0"/>
+  </g>
+  <!-- magnifier -->
+  <circle cx="156" cy="158" r="42" fill="#1E2125" stroke="#E6E6E6" stroke-width="13"/>
+  <circle cx="156" cy="158" r="20" fill="none" stroke="#3D8BFD" stroke-width="8"/>
+  <line x1="188" y1="190" x2="222" y2="224" stroke="#E6E6E6" stroke-width="17" stroke-linecap="round"/>
+</svg>

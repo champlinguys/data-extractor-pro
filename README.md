@@ -8,6 +8,16 @@ paired QLC-NAND image and Optane-cache image.
 > step-by-step guide in **[RECOVERY.md](RECOVERY.md)** - from making a boot USB
 > to exporting the files.
 
+## Download
+Prebuilt Linux binaries are on the [Releases](../../releases) page - no building
+required:
+- **DataExtractorPro-x86_64.AppImage** (GUI). Download it, then
+  `chmod +x DataExtractorPro-x86_64.AppImage && ./DataExtractorPro-x86_64.AppImage`.
+  Qt and OpenSSL are bundled in, so there are no dependencies to install.
+- **de-cli-linux-x86_64.tar.gz** (the headless command-line tool).
+
+Prefer to build from source? See [Building](#building) below.
+
 Status:
 - **NTFS** open -> browse -> export - working (Qt5 GUI + CLI).
 - **Intel Optane reconstruction (span merge)** - working: merges a QLC + Optane

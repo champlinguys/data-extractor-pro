@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Data Extractor Pro
+Comment=Disk-image data recovery: NTFS, Intel Optane, BitLocker
+Exec=data-extractor
+Icon=data-extractor-pro
+Categories=Utility;System;
+Terminal=false
