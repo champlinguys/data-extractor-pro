@@ -13,8 +13,8 @@ namespace de::bitlocker {
 //
 // Note: correctness depends on the underlying (encrypted) source actually
 // holding current ciphertext. With the Optane span merge that is true for the
-// span-covered range (which includes the boot region, FVE metadata, and — on
-// this class of device — the $MFT); reads outside it fall back to stale QLC.
+// span-covered range (which includes the boot region, FVE metadata, and - on
+// this class of device - the $MFT); reads outside it fall back to stale QLC.
 class BitLockerSource : public ImageSource {
 public:
     BitLockerSource(std::shared_ptr<ImageSource> encrypted, VolumeKeys keys,

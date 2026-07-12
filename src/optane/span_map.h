@@ -7,10 +7,10 @@ namespace de::optane {
 
 // The verified, decodable half of Intel Optane reconstruction: the Optane
 // "span component" is a linear, sector-for-sector copy of the cached volume
-// starting at a fixed disk LBA (see FORMAT_NOTES.md §2c). This map serves that
+// starting at a fixed disk LBA (see FORMAT_NOTES.md section 2c). This map serves that
 // region from the Optane and everything else from the QLC.
 //
-// It does NOT cover blocks held only in the hashed NV-cache (§3, undecoded), so
+// It does NOT cover blocks held only in the hashed NV-cache (section 3, undecoded), so
 // it is exact for the span range (which crucially includes the BitLocker FVE
 // metadata) and falls back to the QLC elsewhere.
 class SpanCacheMap : public NvCacheMap {

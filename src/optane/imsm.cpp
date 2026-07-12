@@ -19,7 +19,7 @@ std::optional<uint64_t> findImsm(ImageSource& img, uint64_t hintRegion) {
         if (std::memcmp(probe.data(), IMSM_SIG, IMSM_SIG_LEN) == 0)
             return hintRegion + IMSM_OFFSET_IN_REGION;
     }
-    // Fallback: sequential scan (slow on a full 27 GB device — prefer the hint).
+    // Fallback: sequential scan (slow on a full 27 GB device - prefer the hint).
     const size_t win = 16 * 1024 * 1024;
     const size_t overlap = IMSM_SIG_LEN;
     std::vector<uint8_t> buf;

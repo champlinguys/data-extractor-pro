@@ -98,12 +98,12 @@ int main(int argc, char** argv) {
             auto vol = p.asSource(merged);
             auto md = de::bitlocker::parseFve(*vol);
             if (!md) continue;
-            std::printf("BitLocker volume @ sector %llu — %s\n",
+            std::printf("BitLocker volume @ sector %llu - %s\n",
                         (unsigned long long)(p.firstByte / 512),
                         de::bitlocker::methodName(md->method));
             auto keys = de::bitlocker::unlockWithRecovery(*md, recovery);
             if (!keys) { std::fprintf(stderr, "UNLOCK FAILED (wrong key or no recovery protector)\n"); return 1; }
-            std::printf("UNLOCK OK — VMK and FVEK recovered (MACs verified), FVEK %zu bytes\n",
+            std::printf("UNLOCK OK - VMK and FVEK recovered (MACs verified), FVEK %zu bytes\n",
                         keys->fvek.size());
 
             // Decrypt a test sector and show it. Default: 64 MiB into the volume
@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
             uint8_t sec[512];
             std::memcpy(sec, enc.data(), 512);
             de::bitlocker::aesXtsDecryptSector(*keys, testOff / 512, sec);
-            std::printf("decrypted volume offset %llu — ASCII preview:\n  ",
+            std::printf("decrypted volume offset %llu - ASCII preview:\n  ",
                         (unsigned long long)testOff);
             for (int i = 0; i < 96; ++i)
                 std::putchar((sec[i] >= 0x20 && sec[i] < 0x7F) ? sec[i] : '.');
@@ -194,7 +194,7 @@ int main(int argc, char** argv) {
                              files, (unsigned long long)bytes, outRoot.c_str());
                 return 0;
             }
-            std::printf("Reconstructed + decrypted %s volume — root listing:\n",
+            std::printf("Reconstructed + decrypted %s volume - root listing:\n",
                         fs->typeName().c_str());
             for (auto& c : fs->listDir(fs->root()))
                 std::printf("  %-8llu %s %14llu  %s\n",

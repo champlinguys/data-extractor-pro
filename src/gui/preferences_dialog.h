@@ -16,7 +16,7 @@ public:
     explicit PreferencesDialog(QWidget* parent = nullptr);
 
 signals:
-    void themeChanged();   // theme/accent/font changed — re-apply now
+    void themeChanged();   // theme/accent/font changed - re-apply now
 
 private:
     void loadFromPrefs();

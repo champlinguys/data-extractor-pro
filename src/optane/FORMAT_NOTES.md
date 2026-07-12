@@ -1,4 +1,4 @@
-# Intel Optane Memory (RST) reconstruction — reverse-engineering notes
+# Intel Optane Memory (RST) reconstruction - reverse-engineering notes
 
 Working notes from analysing a real Intel Optane Memory **H10** module
 (two NVMe namespaces: QLC = `/dev/nvme0n1`, Optane = `/dev/nvme1n1`), imaged
@@ -29,11 +29,11 @@ Optane optane.img 29,260,513,280 B =    57,149,440 sectors (27.25 GiB)
 ```
 
 a reference tool's interpretation of the Optane device:
-- **Span component partition** — sector 0, 7.25 GB   (holds cached DATA blocks)
-- **Intel Cache partition**    — sector **15206656** (byte 7,785,807,872), 20 GB
+- **Span component partition** - sector 0, 7.25 GB   (holds cached DATA blocks)
+- **Intel Cache partition** - sector **15206656** (byte 7,785,807,872), 20 GB
   (holds the RST/NV-cache **metadata**, incl. the mapping table)
 
-The Optane image has **no valid GPT** — the leading bytes are RST data, not a
+The Optane image has **no valid GPT** - the leading bytes are RST data, not a
 partition table (sector 0 is actually a cached BitLocker/FAT32-style header).
 
 ## 2. Metadata signatures (in the Intel Cache region, from sector 15206656)
@@ -49,7 +49,7 @@ Two structures, interleaved and stored in **redundant 8 KiB-strided copies**:
 
 Device serial / volume name throughout: `<device-serial-redacted>`. RST version `17.0`.
 
-### 2a. IMSM RAID super (`Intel Raid ISM Cfg Sig.`) — DOCUMENTED
+### 2a. IMSM RAID super (`Intel Raid ISM Cfg Sig.`) - DOCUMENTED
 
 This is the same on-disk format Linux `mdadm` implements (`super-intel.c`,
 `struct imsm_super`). Parsed values from this module:
@@ -61,9 +61,9 @@ generation_num      1,060,296
 num_disks           1
 num_raid_devs       1
 disk[0].serial      "<device-serial-redacted>"
-disk[0].total_blocks 1,000,215,216   == exact QLC image size  ← the cached disk
+disk[0].total_blocks 1,000,215,216   == exact QLC image size  <- the cached disk
 dev.volume          "<device-serial-redacted>"
-dev.size            1,000,210,695     ← reconstructed logical volume size
+dev.size            1,000,210,695     <- reconstructed logical volume size
 ```
 
 Field offsets (from mdadm), relative to the signature start:
@@ -81,7 +81,7 @@ Field offsets (from mdadm), relative to the signature start:
 **Conclusion:** the IMSM super gives us the logical volume geometry and confirms
 the QLC is the backing disk. This part we can parse today (see `imsm.h`).
 
-### 2b. NV Cache Cfg (`Intel IMSM NV Cache Cfg. Sig.`) — the Optane extension
+### 2b. NV Cache Cfg (`Intel IMSM NV Cache Cfg. Sig.`) - the Optane extension
 
 Header (relative to signature start):
 ```
@@ -106,19 +106,19 @@ byte offsets* yields valid `-FVE-FS-` FVE-metadata-block headers whose own
 copy-pointer arrays read back the same three offsets. The QLC has only zeros /
 stale NTFS at those offsets.
 
-Consequence: for the covered range, reconstruction is trivial — take the bytes
+Consequence: for the covered range, reconstruction is trivial - take the bytes
 from the Optane span, not the QLC. Crucially this range contains the **BitLocker
 FVE metadata**, i.e. everything the decryption layer needs.
 
 Open: the exact end of the linear region and whether it is contiguous or itself
-governed by the mapping table (§3). Confirmed linear at least through 0xb2d1c000
-(≈2.79 GB).
+governed by the mapping table (section 3). Confirmed linear at least through 0xb2d1c000
+(~2.79 GB).
 
-## 3. The mapping table (partially decoded — the crux, still OPEN)
+## 3. The mapping table (partially decoded - the crux, still OPEN)
 
-Located deep in the cache region (~64–72 MiB past the metadata anchor in this
+Located deep in the cache region (~64-72 MiB past the metadata anchor in this
 module). It is a **sparse / hashed table of 16-byte records**, NOT a flat sorted
-array — records with unrelated keys sit adjacent, so entries are bucketed by a
+array - records with unrelated keys sit adjacent, so entries are bucketed by a
 hash of the key, with mostly-zero slots between.
 
 Record layout (observed):
@@ -126,7 +126,7 @@ Record layout (observed):
 struct nvc_entry {          // 16 bytes
     u32 key;                // a volume LBA (appears in 512B-granular table)
     u32 value;              // a second LBA-sized field
-    u64 tail;               // usually 0 — chain pointer / flags / LRU?
+    u64 tail;               // usually 0 - chain pointer / flags / LRU?
 };
 ```
 
@@ -146,41 +146,41 @@ proved the header is physically at Optane byte 0 via the linear span. So either
 (a) the record columns are `(start_lba, end_lba)` of a cached extent and the
 data location is implied by the linear span offset `(key - partition_start)`, or
 (b) there are two independent mechanisms (linear span for a pinned prefix, hash
-map for the rest). Keys seen span the whole disk (e.g. 4761, 991558, …), which a
-single span-relative scheme can't cover — pointing at (b). Resolving this is the
+map for the rest). Keys seen span the whole disk (e.g. 4761, 991558, ...), which a
+single span-relative scheme can't cover - pointing at (b). Resolving this is the
 remaining crux.
 
 ### Structures found so far (corrected)
 The cache-metadata region holds at least three distinct structures:
 1. **Header block** (`0x0000`, NV Cache Cfg) + IMSM super (`0x1E00`), 8 KiB copies.
 2. **Flat sorted u32 index array** at `0x4000`: strictly increasing values
-   `1803, 4761, 10693, 991558, 999826, 1006964, …` (verified authoritative).
-   These are NOT (key,val) pairs — a single sorted sequence, ~disk-LBA
-   magnitude, entries ~7–8 K sectors apart after an initial jump. Almost
+   `1803, 4761, 10693, 991558, 999826, 1006964, ...` (verified authoritative).
+   These are NOT (key,val) pairs - a single sorted sequence, ~disk-LBA
+   magnitude, entries ~7-8 K sectors apart after an initial jump. Almost
    certainly a **binary-search index of cached disk LBAs / extent starts**. The
    matching Optane locations must live in a *parallel* array (i-th location for
-   i-th sorted LBA) — not yet located.
+   i-th sorted LBA) - not yet located.
 3. **16-byte records** `[u32 a][u32 b][u64 0]` deep in the region (~72 MiB in),
    e.g. `(567296, 571968)` for the BitLocker header sector.
 
 ### Hypotheses tested and DISPROVEN (do not retry these)
-- `b` (or `val`) is the Optane sector/byte of key's data — reading it gives
+- `b` (or `val`) is the Optane sector/byte of key's data - reading it gives
   encrypted data, not the `-FVE-FS-` header the anchor must resolve to.
-- Reverse map `Optane[a] == Optane[b-partStart]` (span oracle) — no matches.
-- 0x4000 as interleaved `(disk_lba, optane_lba)` pairs — the array is a single
+- Reverse map `Optane[a] == Optane[b-partStart]` (span oracle) - no matches.
+- 0x4000 as interleaved `(disk_lba, optane_lba)` pairs - the array is a single
   strictly-sorted sequence, so any pairing is an artifact.
 
 ### It is a multi-level index (B-tree/hash), not keys+parallel-values
 Chasing the "parallel value array" showed the `0x4000` region is a **fixed
 16 KiB node**: `[header @0x4000][2543 sorted u32 keys @0x4008..0x67c4]
 [0xFFFFFFFF padding to 0x8000]`, then zeros. Critically, the sorted keys span
-the **entire 32-bit range** (4761 … ~0xFFD2C455), far beyond the ~1e9-sector
-disk — so they are **hashes / separator keys, not disk LBAs**.
+the **entire 32-bit range** (4761 ... ~0xFFD2C455), far beyond the ~1e9-sector
+disk - so they are **hashes / separator keys, not disk LBAs**.
 
 Model that now fits all evidence: a **B-tree (or hashed) index** whose root/
 internal node is this 16 KiB block of 2543 separator keys, pointing to leaf
 nodes that hold the ~396 K `[u32 a][u32 b][u64 0]` records (~156 records/leaf).
-Lookup is: hash(disk_lba) → binary-search separators → leaf → record → Optane
+Lookup is: hash(disk_lba) -> binary-search separators -> leaf -> record -> Optane
 location. The word `1803` at `0x4004` is not the key count (2543 keys observed);
 likely a generation/counter.
 
@@ -193,21 +193,21 @@ assumptions that this multi-level model explains away.
 ### Open questions (what the next session must resolve)
 1. **Which column is the Optane location, and in what units + base offset?**
    The value `0x8ba40` read directly as an Optane sector is high-entropy
-   (encrypted) data, not the `-FVE-FS-` header — so `value` is **not** a raw
+   (encrypted) data, not the `-FVE-FS-` header - so `value` is **not** a raw
    Optane sector, or the cache-data area has a non-zero base and/or 4 KiB units.
 2. **How is the cache-data region addressed?** the reference tool shows a 7.25 GB "span
    component" at Optane sector 0 that likely holds the cached data blocks.
    Need the base offset + granularity that turns a `value` into a byte offset.
 3. **Hash/tree structure:** how to look up an arbitrary volume LBA (bucket
    function, collision chaining via `tail`, or a tree we walk).
-4. **QLC vs Optane precedence:** presumably "present in cache map ⇒ read Optane,
+4. **QLC vs Optane precedence:** presumably "present in cache map => read Optane,
    else read QLC", but confirm dirty vs clean flags in `tail`.
 
 ### How to resolve them (method that works here)
 We have **ground truth**: for many sectors we can compare QLC (stale) vs the
 correct answer. Procedure:
 1. Extract the entire mapping table region to a file.
-2. Enumerate all non-zero 16-byte records; build candidate `key→value` maps for
+2. Enumerate all non-zero 16-byte records; build candidate `key->value` maps for
    each granularity/units hypothesis.
 3. For each hypothesis, reconstruct a few hundred sectors and score them: a
    correct mapping makes partition 3 parse as a coherent BitLocker volume and
@@ -224,34 +224,33 @@ whole problem:
 - **Linear span [0, ~7.25 GB) is authoritative.** Sampling 1468 populated
   offsets across the *entire* span range: **99.93 % correct** (decrypt(Optane
   span) == `.dsk`). The only failures are a **~3 MB sliver at the very end**
-  (7.422–7.425 GiB): last-200 MB dense sample = 1.5 % wrong, all in the last
+  (7.422-7.425 GiB): last-200 MB dense sample = 1.5 % wrong, all in the last
   ~3 MB. So the span is a fully linear, correct copy except its tail.
 - **Beyond the span, QLC is ~99.8 % authoritative.** High-offset sample
-  [8 GB..476 GB]: 494/495 correct. Deep-volume files (the ones the GUI marks ⚠)
-  are almost always already correct from QLC — **the ⚠ marker is mostly a false
+  [8 GB..476 GB]: 494/495 correct. Deep-volume files (the ones the GUI marks )
+  are almost always already correct from QLC - **the  marker is mostly a false
   alarm.**
 - **But beyond-span caching is real, not noise.** Around 386 GiB there is a
   **contiguous 331-block (~170 KB) stale cluster** (a recently-written file);
-  its correct data physically exists in the Optane at offset 9,634,217,984 —
-  i.e. inside the 20 GB **Intel Cache region**, not the span. disk_lba
+  its correct data physically exists in the Optane at offset 9,634,217,984 -   i.e. inside the 20 GB **Intel Cache region**, not the span. disk_lba
   810069515 and that location do **not** appear as raw u32 in the metadata head,
-  so these blocks are addressed by the **hashed index** (§3), which remains
+  so these blocks are addressed by the **hashed index** (section 3), which remains
   undecoded.
 
 ### Consequence for the tool
 The current **span + QLC reconstruction is already ~99.9 % correct** and matches
-the reference tool for the vast majority of populated data. Residual defects are < 0.1–0.2 %:
+the reference tool for the vast majority of populated data. Residual defects are < 0.1-0.2 %:
 (a) the ~3 MB span-tail sliver, and (b) rare beyond-span cached clusters
 (recently-written deep files) that live in the Intel Cache region and need the
-hashed index to locate. The records enumerated at the region head (§3) are
+hashed index to locate. The records enumerated at the region head (section 3) are
 dominated by **linear** entries (2956/2956 sampled populated records had their
 data at the span offset), confirming the span *is* the cache's linear data
 store; they do not reveal the beyond-span/relocated location encoding.
 
 ### Records: structure recap (from oracle-backed sampling)
-- 396 K `[u32 a][u32 b][u64 0]` records; unique keys 287 … 41,943,041.
+- 396 K `[u32 a][u32 b][u64 0]` records; unique keys 287 ... 41,943,041.
 - `a` = a cached disk LBA. Sampled records are 100 % linear
-  (data at `(a-PART_START)*512` in the span). `b` ≈ `a` ± small (extent
+  (data at `(a-PART_START)*512` in the span). `b` ~ `a` +/- small (extent
   bookkeeping / run length), NOT a relocated location for the linear majority.
 - The relocated/beyond-span minority is addressed by the hashed index whose
   leaf-location encoding is still not cracked.
@@ -267,7 +266,7 @@ readAt(volume_off, len):
         else:                                     read QLC at vlba
 ```
 Everything above (partition scan, NTFS/etc.) then runs unchanged on the merged
-source. After that, partition 3 is BitLocker → hand the volume to the BitLocker
+source. After that, partition 3 is BitLocker -> hand the volume to the BitLocker
 layer (see `../bitlocker/NOTES.md`) with the user's recovery key.
 
 ## 5. Reproducing the analysis

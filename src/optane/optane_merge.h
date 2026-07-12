@@ -9,7 +9,7 @@ namespace de::optane {
 
 // The decoded NV-cache mapping: for a volume LBA that is resident in Optane,
 // where to read it from. This is the piece still under reverse-engineering
-// (see FORMAT_NOTES.md §3); the interface is fixed so the merge logic is ready.
+// (see FORMAT_NOTES.md section 3); the interface is fixed so the merge logic is ready.
 class NvCacheMap {
 public:
     virtual ~NvCacheMap() = default;
@@ -21,7 +21,7 @@ public:
 // Merged Optane+QLC volume presented as a single ImageSource. Reads are served
 // per-sector from Optane where the cache map has a current copy, otherwise from
 // the QLC. Everything above (partition scan, filesystem parsers) runs unchanged
-// on top of this — including handing partition 3 to the BitLocker layer.
+// on top of this - including handing partition 3 to the BitLocker layer.
 //
 // With a null map it degrades to a pure QLC passthrough (the stale view), so
 // the rest of the tool works today and gains correctness the moment the map is

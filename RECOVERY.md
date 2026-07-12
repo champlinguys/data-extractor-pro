@@ -1,21 +1,21 @@
-# Recovering data from an Intel Optane laptop — step-by-step
+# Recovering data from an Intel Optane laptop - step-by-step
 
 This guide covers pulling the data off a laptop that uses **Intel Optane Memory
-(H10/H20)** — the setup where a single M.2 slot holds *two* drives (a big QLC SSD
+(H10/H20)** - the setup where a single M.2 slot holds *two* drives (a big QLC SSD
 and a small Optane cache). You have to image **both** and merge them, because
 recent files can live only in the Optane cache.
 
-> 🛟 **Strongly consider a professional data recovery service first.** If the data
+> **Strongly consider a professional data recovery service first.** If the data
 > matters to you, or if the drive is failing, clicking, or already showing
 > errors, the safest choice is to hand it to a professional who has cleanroom
-> tools and imaging hardware. A wrong move — or one more power-on of a dying
-> drive — can turn a recoverable situation into permanent loss. **Treat the
+> tools and imaging hardware. A wrong move - or one more power-on of a dying
+> drive - can turn a recoverable situation into permanent loss. **Treat the
 > steps below as a last resort, to be attempted only if you accept full
 > responsibility for the outcome.**
 
-> ⚠️ **Golden rule:** we only ever *read* from the laptop's drives. Never let any
+> **Golden rule:** we only ever *read* from the laptop's drives. Never let any
 > command write to them. The one dangerous mistake is swapping the order of the
-> `ddrescue` command — double-check it every time (Step 4).
+> `ddrescue` command - double-check it every time (Step 4).
 
 Read the **[Disclaimer](#disclaimer)** at the end before you begin.
 
@@ -23,13 +23,13 @@ Read the **[Disclaimer](#disclaimer)** at the end before you begin.
 
 ## What you'll need
 - The **laptop** (or its Optane M.2 module in a compatible machine).
-- A **USB stick** (≥ 2 GB) to make a boot drive.
-- An **external drive**, formatted **exFAT**, big enough for **both** images —
-  for a 512 GB laptop that's about **550 GB**, so a **1 TB** external is safe.
+- A **USB stick** (>= 2 GB) to make a boot drive.
+- An **external drive**, formatted **exFAT**, big enough for **both** images.
+  For a 512 GB laptop that is about **550 GB**, so a **1 TB** external is safe.
 - A second computer running **Ubuntu** (or similar Linux) to run the recovery
   tool afterward.
 - The **BitLocker recovery key** if the laptop's data drive is encrypted (most
-  modern Windows laptops are). It's a 48-digit number — see
+  modern Windows laptops are). It's a 48-digit number - see
   [Finding your BitLocker recovery key](#finding-your-bitlocker-recovery-key)
   below.
 
@@ -50,7 +50,7 @@ Try these, in order:
    devices, match by the **Key ID** shown on the BitLocker recovery screen.
 2. **A work or school account.** If the laptop was managed by an employer or
    school, the key may be in **Azure AD / Microsoft Entra**
-   (https://myaccount.microsoft.com → *Devices*), or your IT administrator can
+   (https://myaccount.microsoft.com -> *Devices*), or your IT administrator can
    retrieve it.
 3. **Where it was saved when BitLocker was turned on.** It may have been printed,
    saved to a `.txt` file, or stored on a USB stick at setup time.
@@ -59,12 +59,12 @@ Try these, in order:
    lists the recovery password.
 
 If you genuinely cannot locate the key and the drive is encrypted, the encrypted
-data is not recoverable by any tool — a professional service cannot bypass
+data is not recoverable by any tool - a professional service cannot bypass
 BitLocker either. The key is essential.
 
 ---
 
-## Step 1 — Make a SystemRescue boot USB
+## Step 1 - Make a SystemRescue boot USB
 SystemRescue is a small Linux that boots from USB and includes `ddrescue`.
 
 1. On any computer, download the SystemRescue ISO from
@@ -74,15 +74,15 @@ SystemRescue is a small Linux that boots from USB and includes `ddrescue`.
    click **Flash**.
 3. When it finishes, you have a bootable SystemRescue USB.
 
-## Step 2 — Boot the laptop from the USB, plug in the external drive
+## Step 2 - Boot the laptop from the USB, plug in the external drive
 1. Insert the SystemRescue USB into the laptop.
 2. Power on and open the boot menu (usually tapping **F12**, **F9**, or **Esc**
-   right after powering on — it varies by brand). Choose the USB stick.
+   right after powering on - it varies by brand). Choose the USB stick.
 3. At the SystemRescue menu, press **Enter** to boot to the default option.
    After a minute you'll get a text command prompt.
 4. Now plug your **exFAT external drive** into a USB port on the laptop.
 
-## Step 3 — Identify the two Optane drives
+## Step 3 - Identify the two Optane drives
 At the prompt, type:
 
 ```sh
@@ -100,8 +100,8 @@ sda       931G  My exFAT Disk  <- your external drive
 ```
 
 **Write these down.** The rule is simple:
-- **Larger** NVMe (hundreds of GB) = **QLC** → we'll call its image `qlc.img`.
-- **Smaller** NVMe (~16–32 GB) = **Optane** → we'll call its image `optane.img`.
+- **Larger** NVMe (hundreds of GB) = **QLC** -> we'll call its image `qlc.img`.
+- **Smaller** NVMe (~16-32 GB) = **Optane** -> we'll call its image `optane.img`.
 - The **external drive** is usually `sda` (or `sdb`). Confirm by its size/label.
 
 Now mount your external drive so we can save the images to it:
@@ -114,9 +114,9 @@ mount /dev/sda1 /mnt/backup        # <- use YOUR external drive's name + "1"
 (If `sda1` gives an error, run `lsblk -f` and use the partition that shows an
 `exfat` filesystem, e.g. `sdb1`.)
 
-## Step 4 — Image both drives with ddrescue
+## Step 4 - Image both drives with ddrescue
 Run these **two** commands, one at a time. Each reads an entire drive into a file
-on your external disk. **Do not swap the order of the arguments** — the `/dev/...`
+on your external disk. **Do not swap the order of the arguments** - the `/dev/...`
 device comes **first** (the source we read), the `/mnt/backup/...` file comes
 **second** (where we save it).
 
@@ -129,7 +129,7 @@ ddrescue -f -n -d /dev/nvme1n1 /mnt/backup/optane.img /mnt/backup/optane.log
 ```
 
 What the options mean: `-f` allow writing the image file, `-n` fast pass (no slow
-scraping — good for a first copy), `-d` read the drive directly. The `.log` file
+scraping - good for a first copy), `-d` read the drive directly. The `.log` file
 lets ddrescue resume if it's interrupted, so don't delete it.
 
 The QLC can take a while (hundreds of GB). When both finish, flush and power off:
@@ -142,7 +142,7 @@ poweroff
 
 Unplug the external drive.
 
-## Step 5 — Recover the files on your Ubuntu workstation
+## Step 5 - Recover the files on your Ubuntu workstation
 1. Plug the external drive into your Ubuntu computer. It should mount
    automatically; note the folder (often `/media/<you>/<label>/`). You now have
    `qlc.img` and `optane.img` there.
@@ -169,7 +169,7 @@ Unplug the external drive.
    ./build/data-extractor
    ```
 
-   Then **File → Open Optane Set…**, and fill in:
+   Then **File -> Open Optane Set...**, and fill in:
    - **QLC image:** your `qlc.img`
    - **Optane image:** your `optane.img`
    - **Cache sector:** the `<cacheSector>` number from step 3
@@ -178,10 +178,10 @@ Unplug the external drive.
 
    Click **OK**. After a short wait, the reconstructed, decrypted drive appears.
    Expand the partitions, tick the checkboxes next to the folders/files you want,
-   and use **File → Export Selected** to copy them out — the folder structure is
+   and use **File -> Export Selected** to copy them out - the folder structure is
    preserved.
 
-That's it — the merged Optane image plus the recovery key gives you the current,
+That's it - the merged Optane image plus the recovery key gives you the current,
 correct files, including anything that was still sitting in the Optane cache.
 
 ---
@@ -206,7 +206,7 @@ ddrescue -f -d /dev/nvme0n1 /mnt/backup/qlc.img /mnt/backup/qlc.log
 ```
 
 For a truly unstable drive, seek professional imaging hardware rather than
-pushing it — every extra read is wear on a dying drive.
+pushing it - every extra read is wear on a dying drive.
 
 ---
 
@@ -217,7 +217,7 @@ Please read this carefully before using this guide or the software.
   any kind, express or implied, to the fullest extent permitted by law. See the
   [LICENSE](LICENSE) (GNU GPL v3) for the full terms.
 - **You act at your own risk.** Data recovery is inherently risky. Following
-  these steps can result in **permanent, unrecoverable data loss** — for example
+  these steps can result in **permanent, unrecoverable data loss** - for example
   by mistyping a command, selecting the wrong drive, or powering on a failing
   drive one time too many. You are solely responsible for the outcome.
 - **No liability.** The authors and contributors are not liable for any loss of

@@ -68,7 +68,7 @@ private:
     // Export: gather the checked subtree roots, then mirror each to disk by
     // walking the filesystem (so lazily-unloaded children are included too).
     void collectExportRoots(QTreeWidgetItem* item, QList<QTreeWidgetItem*>& out);
-    // Runs on the export worker thread — must not touch any Qt widgets.
+    // Runs on the export worker thread - must not touch any Qt widgets.
     void exportWalk(de::Filesystem* fs, const de::FsNode& node, const QString& destDir);
 
     bool updatingChecks_ = false;  // reentrancy guard for check propagation

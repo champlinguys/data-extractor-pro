@@ -5,7 +5,7 @@
 #include <optional>
 #include "core/image_source.h"
 
-// Parser for Intel IMSM (Matrix Storage Manager / RST) metadata — the
+// Parser for Intel IMSM (Matrix Storage Manager / RST) metadata - the
 // "Intel Raid ISM Cfg Sig." structure, identical to the format Linux mdadm
 // reads as "imsm". On an Optane Memory module this metadata lives in the Intel
 // Cache region of the Optane device and describes the cached (QLC) disk and the
@@ -13,7 +13,7 @@
 //
 // This is the DOCUMENTED half of Optane reconstruction and is fully
 // implementable today. The NV-cache mapping table (which LBAs are resident in
-// Optane) is the still-open half — see FORMAT_NOTES.md.
+// Optane) is the still-open half - see FORMAT_NOTES.md.
 namespace de::optane {
 
 struct ImsmDisk {

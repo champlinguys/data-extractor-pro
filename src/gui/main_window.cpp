@@ -58,19 +58,19 @@ MainWindow::MainWindow() {
     setWindowTitle("Data Extractor Pro");
     resize(1100, 720);
 
-    auto* openAct = new QAction("&Open Image…", this);
+    auto* openAct = new QAction("&Open Image...", this);
     openAct->setShortcut(QKeySequence::Open);
     connect(openAct, &QAction::triggered, this, &MainWindow::openImage);
 
-    auto* openOptaneAct = new QAction("Open &Optane Set…", this);
+    auto* openOptaneAct = new QAction("Open &Optane Set...", this);
     openOptaneAct->setShortcut(QKeySequence("Ctrl+Shift+O"));
     connect(openOptaneAct, &QAction::triggered, this, &MainWindow::openOptaneSet);
 
-    auto* exportAct = new QAction("&Export Selected…", this);
+    auto* exportAct = new QAction("&Export Selected...", this);
     exportAct->setShortcut(QKeySequence("Ctrl+E"));
     connect(exportAct, &QAction::triggered, this, &MainWindow::exportSelected);
 
-    auto* prefsAct = new QAction("&Preferences…", this);
+    auto* prefsAct = new QAction("&Preferences...", this);
     prefsAct->setShortcut(QKeySequence::Preferences);
     connect(prefsAct, &QAction::triggered, this, &MainWindow::openPreferences);
 
@@ -111,7 +111,7 @@ MainWindow::MainWindow() {
     split->setStretchFactor(1, 2);
     setCentralWidget(split);
 
-    status_ = new QLabel("Open a disk image to begin  (File → Open Image)");
+    status_ = new QLabel("Open a disk image to begin  (File -> Open Image)");
     statusBar()->addWidget(status_);
 
     applyPrefs(); // hex font size, etc. from persisted preferences
@@ -149,7 +149,7 @@ void MainWindow::openOptaneSet() {
     // A path field with a Browse button.
     auto pathRow = [&](const QString& title) -> QLineEdit* {
         auto* edit = new QLineEdit(&dlg);
-        auto* browse = new QPushButton("Browse…", &dlg);
+        auto* browse = new QPushButton("Browse...", &dlg);
         auto* row = new QWidget(&dlg);
         auto* h = new QHBoxLayout(row);
         h->setContentsMargins(0, 0, 0, 0);
@@ -219,7 +219,7 @@ void MainWindow::loadOptaneSet(const QString& qlcPath, const QString& optanePath
     }
     std::string key = recoveryKey.toStdString();
     // The merge + BitLocker key-stretch + reads over a slow image take several
-    // seconds — do them on the worker so the UI never freezes.
+    // seconds - do them on the worker so the UI never freezes.
     runOpen("Optane reconstruction", [this, qlc, opt, cacheHintBytes, key] {
         auto merged = de::optane::makeSpanMerge(qlc, opt, cacheHintBytes);
         if (!merged) {
@@ -259,7 +259,7 @@ MainWindow::prepareVolumes(std::shared_ptr<ImageSource> source, const std::strin
                 fsName = QString::fromStdString(detectFilesystemName(*vol))
                              + "  (BitLocker unlocked)";
             } else {
-                fsName = "BitLocker (unlock failed — wrong key?)";
+                fsName = "BitLocker (unlock failed - wrong key?)";
             }
         }
         out.push_back({p.index, p.typeName, fsName.toStdString(), p.lengthBytes, vol});
@@ -276,7 +276,7 @@ void MainWindow::runOpen(const QString& label, std::function<void()> producer) {
     // Not cancelable: the engine calls (merge/unlock) aren't interruptible.
     // The busy dialog exists so the event loop keeps running (no "not
     // responding") while the worker does the heavy lifting.
-    QProgressDialog progress("Reconstructing and reading the volume…\nThis can take "
+    QProgressDialog progress("Reconstructing and reading the volume...\nThis can take "
                              "a moment over a slow drive.", QString(), 0, 0, this);
     progress.setWindowTitle("Opening");
     progress.setWindowModality(Qt::ApplicationModal);
@@ -322,9 +322,9 @@ void MainWindow::buildTree(const std::vector<PreparedVol>& vols, const QString& 
         item->setData(0, RolePart, v.index);
         item->setData(0, RoleLoaded, false);
         if (fsName.startsWith("NTFS"))
-            item->addChild(new QTreeWidgetItem({QString("…")}));
+            item->addChild(new QTreeWidgetItem({QString("...")}));
     }
-    status_->setText(QString("%1  —  %2, %3 partition(s)")
+    status_->setText(QString("%1 - %2, %3 partition(s)")
                          .arg(label).arg(humanSize(totalSize)).arg(vols.size()));
 }
 
@@ -356,11 +356,11 @@ QTreeWidgetItem* MainWindow::makeNode(const FsNode& node, int partIndex, ItemKin
     // exports its whole subtree (walked from the filesystem, so lazy-unloaded
     // children are included). We manage tri-state manually rather than with
     // Qt::ItemIsAutoTristate, because that flag suppresses the folder's own
-    // checkbox while its only child is the lazy "…" placeholder.
+    // checkbox while its only child is the lazy "..." placeholder.
     item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
     item->setCheckState(0, Qt::Unchecked);
     if (node.isDir)
-        item->addChild(new QTreeWidgetItem({QString("…")})); // lazy placeholder
+        item->addChild(new QTreeWidgetItem({QString("...")})); // lazy placeholder
     return item;
 }
 
@@ -387,7 +387,7 @@ void MainWindow::populateChildren(QTreeWidgetItem* item) {
     }
 
     auto children = fs->listDir(dir);
-    // Directories first, then alphabetical — the usual browse ordering.
+    // Directories first, then alphabetical - the usual browse ordering.
     std::sort(children.begin(), children.end(), [](const FsNode& a, const FsNode& b) {
         if (a.isDir != b.isDir) return a.isDir > b.isDir;
         return a.name < b.name;
@@ -445,7 +445,7 @@ void MainWindow::onItemSelected() {
         return head.size() < kPreview; // stop once we have enough
     });
     hex_->setData(head);
-    status_->setText(QString("%1  —  %2")
+    status_->setText(QString("%1 - %2")
                          .arg(item->data(0, RoleName).toString())
                          .arg(humanSize(f.size)));
 }
@@ -531,7 +531,7 @@ void MainWindow::exportWalk(Filesystem* fs, const FsNode& node, const QString& d
         // Name-collision policy.
         if (std::filesystem::exists(outPath.toStdString())) {
             if (exportCollision_ == 2) return;                 // skip
-            if (exportCollision_ == 0) {                       // rename: file (1), (2)…
+            if (exportCollision_ == 0) {                       // rename: file (1), (2)...
                 QFileInfo fi(outPath);
                 for (int n = 1; ; ++n) {
                     QString cand = QDir(fi.path()).filePath(
@@ -626,11 +626,11 @@ void MainWindow::exportSelected() {
     exportBytes_ = 0; exportFiles_ = 0; exportFails_ = 0;
     { std::lock_guard<std::mutex> lk(exportNameMutex_); exportName_.clear(); }
 
-    QProgressDialog progress("Starting export…", "Cancel", 0, 0, this);
+    QProgressDialog progress("Starting export...", "Cancel", 0, 0, this);
     progress.setWindowTitle("Exporting");
     progress.setWindowModality(Qt::ApplicationModal);
     progress.setMinimumDuration(0);
-    // Only a real Cancel click / Esc / close sets the flag — no processEvents
+    // Only a real Cancel click / Esc / close sets the flag - no processEvents
     // polling that could trip it spuriously.
     connect(&progress, &QProgressDialog::canceled, this, [this] {
         exportCancel_ = true;
@@ -659,7 +659,7 @@ void MainWindow::exportSelected() {
     });
     timer.start(150);
 
-    progress.exec();       // normal event loop runs here — UI stays responsive
+    progress.exec();       // normal event loop runs here - UI stays responsive
     timer.stop();
     exportCancel_ = true;  // ensure the worker unwinds if the dialog closed early
     worker.join();

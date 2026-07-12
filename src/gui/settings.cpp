@@ -92,7 +92,7 @@ void savePrefs() {
 
 void applyTheme(QApplication& app, const Prefs& p) {
     // Fusion honours QPalette consistently across platforms, which native
-    // styles don't — required for a real dark mode.
+    // styles don't - required for a real dark mode.
     app.setStyle(QStyleFactory::create("Fusion"));
 
     Accent ac = accentByName(p.accentName);

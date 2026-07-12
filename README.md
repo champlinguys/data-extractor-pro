@@ -1,24 +1,23 @@
 # Data Extractor Pro
 
 A disk-image data-recovery tool in the spirit of DMDE / R-Studio: open a raw
-disk image, browse its filesystems in a tree, preview files, and export them —
-including reconstructing **Intel Optane Memory (H10/H20)** volumes from a
+disk image, browse its filesystems in a tree, preview files, and export them - including reconstructing **Intel Optane Memory (H10/H20)** volumes from a
 paired QLC-NAND image and Optane-cache image.
 
 > **Recovering data from an Optane laptop?** Follow the plain-English,
-> step-by-step guide in **[RECOVERY.md](RECOVERY.md)** — from making a boot USB
+> step-by-step guide in **[RECOVERY.md](RECOVERY.md)** - from making a boot USB
 > to exporting the files.
 
 Status:
-- **NTFS** open → browse → export — working (Qt5 GUI + CLI).
-- **Intel Optane reconstruction (span merge)** — working: merges a QLC + Optane
+- **NTFS** open -> browse -> export - working (Qt5 GUI + CLI).
+- **Intel Optane reconstruction (span merge)** - working: merges a QLC + Optane
   image into the reconstructed disk. An oracle-backed coverage study (see
-  `src/optane/FORMAT_NOTES.md §3b`) showed this span+QLC reconstruction is
-  **~99.9 % correct** — the linear span is authoritative for the volume start,
+  `src/optane/FORMAT_NOTES.md section 3b`) showed this span+QLC reconstruction is
+  **~99.9 % correct** - the linear span is authoritative for the volume start,
   and QLC is authoritative beyond it. Rare recently-written deep files can live
   in the Optane's hashed NV-cache (undecoded); these are a < 0.2 % residual not
   currently recovered.
-- **BitLocker decryption** — working: recovery password → VMK → FVEK →
+- **BitLocker decryption** - working: recovery password -> VMK -> FVEK ->
   AES-XTS-128, browse/extract the decrypted NTFS. Validated byte-for-byte
   against a reference recovery tool on a real Optane H10 case.
 
@@ -41,7 +40,7 @@ find it with `de-cli imsm <optane.img>` if unknown.
 
 ## Building
 
-Requires a C++20 compiler, CMake ≥ 3.16, and Qt5 Widgets.
+Requires a C++20 compiler, CMake >= 3.16, and Qt5 Widgets.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
@@ -67,21 +66,22 @@ independently testable and the hard Optane work slots in without touching the
 filesystem parsers.
 
 ```
-┌─────────────────────────────────────────────┐
-│ GUI (Qt5)              CLI (de-cli)           │  front-ends
-├─────────────────────────────────────────────┤
-│ Filesystem: NTFS  [HFS+]  [ext4]              │  fs/ — browse + read
-├─────────────────────────────────────────────┤
-│ Partition scan: MBR / GPT                     │  partition/
-├─────────────────────────────────────────────┤
-│ ImageSource: Raw │ SubImage │ [OptaneMerge]   │  core/ — the key seam
-└─────────────────────────────────────────────┘
++-----------------------------------------------------+
+| GUI (Qt5)              CLI (de-cli)                  |  front-ends
++-----------------------------------------------------+
+| Filesystem: NTFS  [HFS+]  [ext4]                    |  fs/ - browse + read
++-----------------------------------------------------+
+| Partition scan: MBR / GPT                           |  partition/
++-----------------------------------------------------+
+| ImageSource: Raw | SubImage | OptaneMerge | BitLocker|  core/ - the key seam
++-----------------------------------------------------+
 ```
 
 The pivot is **`ImageSource`** (`src/core/image_source.h`): a raw image, a
-single-partition window, and the future merged Optane view are all just byte
-sources. The filesystem parsers only ever see "a volume of bytes," so Optane
-reconstruction becomes *a new `ImageSource`, not a change to NTFS/HFS+/ext4*.
+single-partition window, the merged Optane volume, and a decrypt-on-read
+BitLocker volume are all just byte sources. The filesystem parsers only ever see
+"a volume of bytes," so Optane reconstruction and BitLocker decryption are each
+*a new `ImageSource`, not a change to NTFS/HFS+/ext4*.
 
 ### What NTFS support does today (`src/fs/ntfs/`)
 - Boot-sector geometry (sector/cluster size, MFT location, record size)
@@ -99,36 +99,31 @@ NTFS-in-GPT-partition layout).
 
 ## Roadmap
 
-### Near term
-- **ext4** — superblock, inode + extent tree (and legacy block maps), HTree
+- **ext4** - superblock, inode + extent tree (and legacy block maps), HTree
   directories. Signature detection already stubbed in `fs_detect.cpp`.
-- **HFS+/HFSX** — volume header, catalog + extents B-trees. Also stubbed.
-- **Deleted-file recovery** — scavenge unallocated MFT records / inodes and
+- **HFS+/HFSX** - volume header, catalog + extents B-trees. Also stubbed.
+- **Deleted-file recovery** - scavenge unallocated MFT records / inodes;
   `FsNode::isDeleted` is already plumbed through the model.
-- NTFS gaps: LZNT1-**compressed** streams, named/alternate data streams,
-  `$Bitmap`-aware allocation. (Compressed streams are detected and flagged.)
-- GUI: recursive folder export, hash-on-export, streaming reads for huge files.
+- NTFS gaps: LZNT1-**compressed** streams and named/alternate data streams.
+  (Compressed streams are detected and flagged.)
+- **Full Optane reconstruction**: decode the Intel RST hashed NV-cache index to
+  recover the last <0.2% of blocks (rare, recently-written data) that the span
+  merge does not yet cover. See `src/optane/FORMAT_NOTES.md`.
 
-### The headline feature — Intel Optane reconstruction
+### How Intel Optane reconstruction works
 Optane Memory H10/H20 puts a 3D-XPoint (Optane) cache and a QLC-NAND SSD behind
-one M.2 connector, fronted by the Intel RST driver. Recent writes can live only
-in the Optane cache, so imaging the QLC alone yields a **stale, inconsistent**
-volume. Recovery needs *both* images merged at the correct LBAs.
+one M.2 connector, managed by the Intel RST driver. Recent writes can live only
+in the Optane cache, so imaging the QLC alone yields a stale, inconsistent
+volume; you need both images merged.
 
-Planned design — a new `OptaneMergeSource : ImageSource`:
-1. Take two child `ImageSource`s: the **QLC** image and the **Optane** image.
-2. Parse the **Intel RST cache-mapping metadata** (the pinned/dirty-block
-   tables that record which LBA ranges are resident in the cache) to build an
-   LBA → {QLC | Optane} translation map.
-3. On `readAt(lba)`, serve each block from whichever medium holds its current
-   version, transparently presenting a single coherent volume.
-4. Everything above — partition scan and the NTFS/ext4/HFS+ parsers — then runs
-   unmodified on the merged source.
-
-Because the merge is *just another `ImageSource`*, the entire browse/export
-stack works over reconstructed Optane volumes with no parser changes. The open
-research task is the exact on-media layout of the RST cache metadata across
-driver versions; that reverse-engineering will land in `src/optane/`.
+`OptaneMergeSource` takes the QLC and Optane images and serves each block from
+whichever medium holds its current version, presenting one coherent volume.
+Everything above it (partition scanning and the filesystem parsers) runs
+unchanged, and a BitLocker partition is handled the same way by an `ImageSource`
+that decrypts on read. An oracle-backed coverage study
+(`src/optane/FORMAT_NOTES.md`) put the current span+QLC merge at ~99.9% correct;
+decoding the RST hashed NV-cache index for the remaining fraction is the one open
+item above.
 
 ## Layout
 ```
@@ -140,5 +135,4 @@ src/cli/         headless driver
 ```
 
 ## License
-Data Extractor Pro is released under the **GNU General Public License v3.0** —
-see [LICENSE](LICENSE).
+Data Extractor Pro is released under the **GNU General Public License v3.0** - see [LICENSE](LICENSE).

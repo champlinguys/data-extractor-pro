@@ -78,7 +78,7 @@ PreferencesDialog::PreferencesDialog(QWidget* parent) : QDialog(parent) {
 
     exportDir_ = new QLineEdit;
     exportDir_->setPlaceholderText("(ask each time)");
-    auto* browse = new QPushButton("Browse…");
+    auto* browse = new QPushButton("Browse...");
     auto* dirRow = new QWidget;
     auto* dh = new QHBoxLayout(dirRow);
     dh->setContentsMargins(0, 0, 0, 0);

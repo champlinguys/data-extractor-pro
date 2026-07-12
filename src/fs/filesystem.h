@@ -45,7 +45,7 @@ public:
     // Stream the file's default data stream to `sink` in bounded-memory chunks.
     // Returns false if the sink aborted. The default buffers the whole file via
     // readFile; NTFS overrides it to read extent-by-extent without loading the
-    // whole file — essential for multi-GB files like hiberfil.sys.
+    // whole file - essential for multi-GB files like hiberfil.sys.
     virtual bool readFileStream(const FsNode& file, const DataSink& sink) {
         auto data = readFile(file);
         return sink(data.data(), data.size());

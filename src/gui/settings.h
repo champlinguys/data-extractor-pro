@@ -7,14 +7,14 @@ class QApplication;
 
 // Application preferences, persisted via QSettings. A single global instance
 // (prefs()) is loaded at startup and saved when the Preferences dialog is
-// accepted. The engine layers never see this — it's GUI-only.
+// accepted. The engine layers never see this - it's GUI-only.
 namespace de::gui {
 
 enum class Theme { Dark, Light };
 enum class HashKind { None, Md5, Sha256 };
 enum class Collision { Rename, Overwrite, Skip };
 
-// A named accent "color combo" — drives selection/highlight/links so the app
+// A named accent "color combo" - drives selection/highlight/links so the app
 // reads as one system. Curated to look good in both dark and light themes.
 struct Accent {
     QString name;
