@@ -111,7 +111,7 @@ MainWindow::MainWindow() {
     split->setStretchFactor(1, 2);
     setCentralWidget(split);
 
-    status_ = new QLabel("Open a disk image to begin  (File -> Open Image)");
+    status_ = new QLabel("Open a disk image to begin (File -> Open Image)");
     statusBar()->addWidget(status_);
 
     applyPrefs(); // hex font size, etc. from persisted preferences

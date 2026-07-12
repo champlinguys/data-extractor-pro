@@ -28,7 +28,7 @@ QLC   qlc.img    512,110,190,592 B = 1,000,215,216 sectors (476.9 GiB)
 Optane optane.img 29,260,513,280 B =    57,149,440 sectors (27.25 GiB)
 ```
 
-a reference tool's interpretation of the Optane device:
+A reference tool's interpretation of the Optane device:
 - **Span component partition** - sector 0, 7.25 GB   (holds cached DATA blocks)
 - **Intel Cache partition** - sector **15206656** (byte 7,785,807,872), 20 GB
   (holds the RST/NV-cache **metadata**, incl. the mapping table)
@@ -195,7 +195,7 @@ assumptions that this multi-level model explains away.
    The value `0x8ba40` read directly as an Optane sector is high-entropy
    (encrypted) data, not the `-FVE-FS-` header - so `value` is **not** a raw
    Optane sector, or the cache-data area has a non-zero base and/or 4 KiB units.
-2. **How is the cache-data region addressed?** the reference tool shows a 7.25 GB "span
+2. **How is the cache-data region addressed?** The reference tool shows a 7.25 GB "span
    component" at Optane sector 0 that likely holds the cached data blocks.
    Need the base offset + granularity that turns a `value` into a byte offset.
 3. **Hash/tree structure:** how to look up an arbitrary volume LBA (bucket
@@ -227,12 +227,13 @@ whole problem:
   (7.422-7.425 GiB): last-200 MB dense sample = 1.5 % wrong, all in the last
   ~3 MB. So the span is a fully linear, correct copy except its tail.
 - **Beyond the span, QLC is ~99.8 % authoritative.** High-offset sample
-  [8 GB..476 GB]: 494/495 correct. Deep-volume files (the ones the GUI marks )
-  are almost always already correct from QLC - **the  marker is mostly a false
-  alarm.**
+  [8 GB..476 GB]: 494/495 correct. Deep-volume files (the ones the GUI flags as
+  possibly stale) are almost always already correct from QLC - **that flag is
+  mostly a false alarm.**
 - **But beyond-span caching is real, not noise.** Around 386 GiB there is a
   **contiguous 331-block (~170 KB) stale cluster** (a recently-written file);
-  its correct data physically exists in the Optane at offset 9,634,217,984 -   i.e. inside the 20 GB **Intel Cache region**, not the span. disk_lba
+  its correct data physically exists in the Optane at offset 9,634,217,984,
+  i.e. inside the 20 GB **Intel Cache region**, not the span. disk_lba
   810069515 and that location do **not** appear as raw u32 in the metadata head,
   so these blocks are addressed by the **hashed index** (section 3), which remains
   undecoded.
@@ -267,7 +268,7 @@ readAt(volume_off, len):
 ```
 Everything above (partition scan, NTFS/etc.) then runs unchanged on the merged
 source. After that, partition 3 is BitLocker -> hand the volume to the BitLocker
-layer (see `../bitlocker/NOTES.md`) with the user's recovery key.
+layer (see `../bitlocker/fve.h`) with the user's recovery key.
 
 ## 5. Reproducing the analysis
 The reverse-engineering was done with small Python scripts (a re-encryption
