@@ -1,16 +1,23 @@
 # Recovering data from an Intel Optane laptop — step-by-step
 
-This guide walks you through pulling the data off a laptop that uses **Intel
-Optane Memory (H10/H20)** — the setup where a single M.2 slot holds *two* drives
-(a big QLC SSD and a small Optane cache). You have to image **both** and merge
-them, because recent files can live only in the Optane cache.
+This guide covers pulling the data off a laptop that uses **Intel Optane Memory
+(H10/H20)** — the setup where a single M.2 slot holds *two* drives (a big QLC SSD
+and a small Optane cache). You have to image **both** and merge them, because
+recent files can live only in the Optane cache.
 
-You do **not** need to be an expert, but you will be typing a few commands
-exactly as shown. Read each step fully before running it.
+> 🛟 **Strongly consider a professional data recovery service first.** If the data
+> matters to you, or if the drive is failing, clicking, or already showing
+> errors, the safest choice is to hand it to a professional who has cleanroom
+> tools and imaging hardware. A wrong move — or one more power-on of a dying
+> drive — can turn a recoverable situation into permanent loss. **Treat the
+> steps below as a last resort, to be attempted only if you accept full
+> responsibility for the outcome.**
 
 > ⚠️ **Golden rule:** we only ever *read* from the laptop's drives. Never let any
 > command write to them. The one dangerous mistake is swapping the order of the
 > `ddrescue` command — double-check it every time (Step 4).
+
+Read the **[Disclaimer](#disclaimer)** at the end before you begin.
 
 ---
 
@@ -22,8 +29,38 @@ exactly as shown. Read each step fully before running it.
 - A second computer running **Ubuntu** (or similar Linux) to run the recovery
   tool afterward.
 - The **BitLocker recovery key** if the laptop's data drive is encrypted (most
-  Windows laptops are). It's a 48-digit number; the owner can get it from
-  https://account.microsoft.com/devices/recoverykey.
+  modern Windows laptops are). It's a 48-digit number — see
+  [Finding your BitLocker recovery key](#finding-your-bitlocker-recovery-key)
+  below.
+
+---
+
+## Finding your BitLocker recovery key
+If the laptop's data drive is encrypted with BitLocker, you **cannot read the
+files without the recovery key**, no matter how well the imaging goes. Get it
+*before* you start. It's a 48-digit number in eight groups, like
+`123456-123456-123456-123456-123456-123456-123456-123456`.
+
+Try these, in order:
+
+1. **Your Microsoft account (most common).** Sign in with the account that was
+   used on the laptop and open:
+   **https://account.microsoft.com/devices/recoverykey**
+   Any keys backed up to that account are listed there. If the owner has several
+   devices, match by the **Key ID** shown on the BitLocker recovery screen.
+2. **A work or school account.** If the laptop was managed by an employer or
+   school, the key may be in **Azure AD / Microsoft Entra**
+   (https://myaccount.microsoft.com → *Devices*), or your IT administrator can
+   retrieve it.
+3. **Where it was saved when BitLocker was turned on.** It may have been printed,
+   saved to a `.txt` file, or stored on a USB stick at setup time.
+4. **On another working computer that can still sign in.** From an admin command
+   prompt on the same machine (if it still boots): `manage-bde -protectors -get C:`
+   lists the recovery password.
+
+If you genuinely cannot locate the key and the drive is encrypted, the encrypted
+data is not recoverable by any tool — a professional service cannot bypass
+BitLocker either. The key is essential.
 
 ---
 
@@ -170,3 +207,30 @@ ddrescue -f -d /dev/nvme0n1 /mnt/backup/qlc.img /mnt/backup/qlc.log
 
 For a truly unstable drive, seek professional imaging hardware rather than
 pushing it — every extra read is wear on a dying drive.
+
+---
+
+## Disclaimer
+Please read this carefully before using this guide or the software.
+
+- **No warranty.** Data Extractor Pro is provided "as is", without warranty of
+  any kind, express or implied, to the fullest extent permitted by law. See the
+  [LICENSE](LICENSE) (GNU GPL v3) for the full terms.
+- **You act at your own risk.** Data recovery is inherently risky. Following
+  these steps can result in **permanent, unrecoverable data loss** — for example
+  by mistyping a command, selecting the wrong drive, or powering on a failing
+  drive one time too many. You are solely responsible for the outcome.
+- **No liability.** The authors and contributors are not liable for any loss of
+  data, hardware damage, downtime, or other damages arising from the use of this
+  guide or the software.
+- **Professionals exist for a reason.** If the data is important or irreplaceable,
+  or the drive shows any sign of failure (noises, errors, disappearing from the
+  system), **stop and consult a professional data recovery service.** A failed
+  DIY attempt can make professional recovery harder or impossible, and every
+  power-on stresses a dying drive.
+- **Only your own data.** Use this only on drives you own or are explicitly
+  authorized to recover. Respect the drive owner's privacy and applicable laws.
+- **Verify before you rely.** After exporting, open and check your recovered
+  files before wiping or returning the source drive.
+
+By proceeding, you acknowledge these risks and accept full responsibility.
