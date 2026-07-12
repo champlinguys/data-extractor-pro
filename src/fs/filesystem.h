@@ -1,0 +1,61 @@
+#pragma once
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <memory>
+#include <functional>
+#include "core/image_source.h"
+
+namespace de {
+
+// One entry in a filesystem tree. `id` is the filesystem-native identifier
+// (for NTFS, the MFT record number) that the parser uses to re-locate the
+// object on demand, so the GUI can browse lazily without holding the whole
+// tree in memory.
+struct FsNode {
+    uint64_t id = 0;
+    std::string name;
+    bool isDir = false;
+    bool isDeleted = false;   // recovered from an unallocated record
+    uint64_t size = 0;
+    int64_t mtime = 0;        // filesystem-native timestamp, 0 if unknown
+
+    bool operator==(const FsNode& o) const { return id == o.id && name == o.name; }
+};
+
+// Abstract filesystem. NTFS is the first implementation; HFS+ and ext4 will
+// implement the same three-method surface (root / list / read) so the GUI and
+// the export path are filesystem-agnostic.
+class Filesystem {
+public:
+    virtual ~Filesystem() = default;
+
+    virtual std::string typeName() const = 0;
+    virtual FsNode root() = 0;
+    virtual std::vector<FsNode> listDir(const FsNode& dir) = 0;
+
+    // Read the (default/unnamed) data stream of a file fully into memory.
+    // Convenient for small files/previews; use readFileStream for large ones.
+    virtual std::vector<uint8_t> readFile(const FsNode& file) = 0;
+
+    // Sink for streamed data: called with successive chunks; return false to
+    // abort (e.g. on write error or user cancel).
+    using DataSink = std::function<bool(const uint8_t* data, size_t len)>;
+
+    // Stream the file's default data stream to `sink` in bounded-memory chunks.
+    // Returns false if the sink aborted. The default buffers the whole file via
+    // readFile; NTFS overrides it to read extent-by-extent without loading the
+    // whole file — essential for multi-GB files like hiberfil.sys.
+    virtual bool readFileStream(const FsNode& file, const DataSink& sink) {
+        auto data = readFile(file);
+        return sink(data.data(), data.size());
+    }
+};
+
+// Sniff the volume and return a mounted Filesystem, or nullptr if unrecognised.
+std::unique_ptr<Filesystem> detectFilesystem(std::shared_ptr<ImageSource> vol);
+
+// Just the type label, for showing in the tree before the user opens a volume.
+std::string detectFilesystemName(ImageSource& vol);
+
+} // namespace de
