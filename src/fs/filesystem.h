@@ -50,6 +50,10 @@ public:
         auto data = readFile(file);
         return sink(data.data(), data.size());
     }
+
+    // Resource fork of a file, or empty if none/not applicable. Default is
+    // empty so existing filesystems (NTFS) need no changes; HFS overrides it.
+    virtual std::vector<uint8_t> readResourceFork(const FsNode& /*file*/) { return {}; }
 };
 
 // Sniff the volume and return a mounted Filesystem, or nullptr if unrecognised.

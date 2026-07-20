@@ -20,6 +20,7 @@ add_library(de_engine STATIC
   src/partition/partition.cpp
   src/fs/fs_detect.cpp
   src/fs/ntfs/ntfs.cpp
+  src/fs/hfs/hfs.cpp
   src/optane/imsm.cpp
   src/optane/optane_merge.cpp
   src/optane/span_map.cpp

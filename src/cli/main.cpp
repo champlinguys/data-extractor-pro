@@ -186,6 +186,12 @@ int main(int argc, char** argv) {
                                     bytes += n; return static_cast<bool>(os);
                                 });
                                 ++files;
+                                if (auto rsrc = fs->readResourceFork(c); !rsrc.empty()) {
+                                    std::ofstream rs(cp + ".rsrc", std::ios::binary);
+                                    rs.write(reinterpret_cast<const char*>(rsrc.data()),
+                                             static_cast<std::streamsize>(rsrc.size()));
+                                    bytes += rsrc.size();
+                                }
                             }
                         }
                     };
@@ -305,6 +311,13 @@ int main(int argc, char** argv) {
             out.write(reinterpret_cast<const char*>(data.data()),
                       static_cast<std::streamsize>(data.size()));
             std::fprintf(stderr, "wrote %zu bytes to %s\n", data.size(), argv[5]);
+            if (auto rsrc = fs->readResourceFork(f); !rsrc.empty()) {
+                std::string rsrcPath = std::string(argv[5]) + ".rsrc";
+                std::ofstream rs(rsrcPath, std::ios::binary);
+                rs.write(reinterpret_cast<const char*>(rsrc.data()),
+                         static_cast<std::streamsize>(rsrc.size()));
+                std::fprintf(stderr, "wrote %zu bytes to %s\n", rsrc.size(), rsrcPath.c_str());
+            }
         }
         return 0;
     }

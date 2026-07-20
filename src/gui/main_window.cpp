@@ -321,7 +321,15 @@ void MainWindow::buildTree(const std::vector<PreparedVol>& vols, const QString& 
         item->setData(0, RoleKind, static_cast<int>(ItemKind::Partition));
         item->setData(0, RolePart, v.index);
         item->setData(0, RoleLoaded, false);
-        if (fsName.startsWith("NTFS"))
+        // Add the lazy-load placeholder (what gives the row its expand arrow)
+        // for any filesystem detectFilesystem() can actually mount - i.e.
+        // anything other than a stub label ("... not yet implemented"), an
+        // unrecognised volume, or BitLocker still locked/failed to unlock.
+        bool browsable = !fsName.contains("not yet implemented") &&
+                          fsName != "Unknown" &&
+                          !fsName.startsWith("BitLocker (encrypted)") &&
+                          !fsName.startsWith("BitLocker (unlock failed");
+        if (browsable)
             item->addChild(new QTreeWidgetItem({QString("...")}));
     }
     status_->setText(QString("%1 - %2, %3 partition(s)")
@@ -560,6 +568,11 @@ void MainWindow::exportWalk(Filesystem* fs, const FsNode& node, const QString& d
         os.close();
         if (ok && !exportCancel_.load()) {
             ++exportFiles_;
+            // Resource fork (classic HFS): write "<name>.rsrc" sidecar if present.
+            if (auto rsrc = fs->readResourceFork(node); !rsrc.empty()) {
+                std::ofstream rs((outPath + ".rsrc").toStdString(), std::ios::binary | std::ios::trunc);
+                rs.write(reinterpret_cast<const char*>(rsrc.data()), static_cast<std::streamsize>(rsrc.size()));
+            }
             if (md) {  // write "<hex>  <filename>" sidecar next to the file
                 unsigned char dig[EVP_MAX_MD_SIZE]; unsigned int dl = 0;
                 EVP_DigestFinal_ex(md, dig, &dl);

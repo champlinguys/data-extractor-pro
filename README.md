@@ -31,6 +31,15 @@ Status:
   AES-XTS-128, browse/extract the decrypted NTFS. Validated byte-for-byte
   against a reference recovery tool on a real Optane H10 case.
 
+- **Classic HFS (pre-HFS+)** - working: the 1985-1998 Macintosh filesystem
+  found on old Mac floppies and small disks, which mainstream tools (Sleuth
+  Kit, DMDE) refuse to open. Parses the Master Directory Block, reassembles
+  the Catalog and Extents-Overflow B-trees (including fragmented catalogs),
+  walks the full directory tree, and exports both data and resource forks
+  (resource forks as `<name>.rsrc` sidecars). Validated byte-for-byte against
+  a reference Python implementation on two real 1.44 MB customer floppies,
+  including heavily fragmented forks.
+
 HFS+ and ext4 are on the roadmap below.
 
 ## Optane + BitLocker workflow (CLI)
@@ -79,7 +88,7 @@ filesystem parsers.
 +-----------------------------------------------------+
 | GUI (Qt5)              CLI (de-cli)                  |  front-ends
 +-----------------------------------------------------+
-| Filesystem: NTFS  [HFS+]  [ext4]                    |  fs/ - browse + read
+| Filesystem: NTFS  HFS  [HFS+]  [ext4]               |  fs/ - browse + read
 +-----------------------------------------------------+
 | Partition scan: MBR / GPT                           |  partition/
 +-----------------------------------------------------+
@@ -106,6 +115,20 @@ BitLocker volume are all just byte sources. The filesystem parsers only ever see
 Verified end-to-end against `mkntfs`-generated images (resident files,
 multi-run 3 MB file extracted byte-for-byte, subdirectories, Unicode, and an
 NTFS-in-GPT-partition layout).
+
+### What classic-HFS support does today (`src/fs/hfs/`)
+- Master Directory Block parsing (`BD` signature at sector 2) - allocation
+  geometry, volume name (MacRoman -> UTF-8), Catalog/Extents-Overflow extents
+- Reassembles the special files by following their extent records, so a
+  **fragmented Catalog** (the case that defeats naive readers) works
+- Generic classic-HFS B-tree reader: header node, reversed per-node offset
+  tables, leaf-chain walk with a scan-all-nodes fallback for damaged headers
+- Full tree enumeration with Mac type/creator codes and HFS-epoch timestamps
+- Fork reads consult the **Extents-Overflow B-tree** when the three inline
+  extents don't cover the logical length (heavily fragmented files)
+- Exports **both forks**: data fork as the file, resource fork as a
+  `<name>.rsrc` sidecar (via `Filesystem::readResourceFork`, default-empty
+  for filesystems without forks)
 
 ## Roadmap
 

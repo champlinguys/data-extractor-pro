@@ -54,4 +54,27 @@ struct Span {
     uint8_t  u8 (size_t off) const { return *at(off, 1); }
 };
 
+// Big-endian read helpers. Classic HFS (unlike NTFS/FAT/GPT above) stores all
+// on-disk structures big-endian, so it needs its own primitives.
+inline uint16_t rdBE16(const uint8_t* p) { return static_cast<uint16_t>((p[0] << 8) | p[1]); }
+inline uint32_t rdBE32(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8)  |  static_cast<uint32_t>(p[3]);
+}
+
+// Bounds-checked big-endian view, mirroring Span.
+struct BSpan {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+
+    const uint8_t* at(size_t off, size_t need) const {
+        if (off + need < off || off + need > size)
+            throw std::out_of_range("BSpan::at out of range");
+        return data + off;
+    }
+    uint16_t u16(size_t off) const { return rdBE16(at(off, 2)); }
+    uint32_t u32(size_t off) const { return rdBE32(at(off, 4)); }
+    uint8_t  u8 (size_t off) const { return *at(off, 1); }
+};
+
 } // namespace de

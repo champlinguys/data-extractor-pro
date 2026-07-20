@@ -1,11 +1,13 @@
 #include "fs/filesystem.h"
 #include "fs/ntfs/ntfs.h"
+#include "fs/hfs/hfs.h"
 #include <cstring>
 
 namespace de {
 
 std::string detectFilesystemName(ImageSource& vol) {
     if (NtfsFilesystem::probe(vol)) return "NTFS";
+    if (HfsFilesystem::probe(vol)) return "HFS";
 
     // BitLocker volume: FVE boot record signature at offset 3.
     uint8_t vbr[512];
@@ -31,6 +33,7 @@ std::string detectFilesystemName(ImageSource& vol) {
 
 std::unique_ptr<Filesystem> detectFilesystem(std::shared_ptr<ImageSource> vol) {
     if (auto ntfs = NtfsFilesystem::open(vol)) return ntfs;
+    if (auto hfs = HfsFilesystem::open(vol)) return hfs;
     // HFS+ and ext4 will slot in here as they come online.
     return nullptr;
 }
