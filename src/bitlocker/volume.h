@@ -32,6 +32,8 @@ private:
     uint64_t hdrOff_;
     uint64_t hdrSize_;
     static constexpr uint64_t SECTOR = 512;
+    // Cap on the per-call decrypt buffer; bounds memory while keeping reads big.
+    static constexpr uint64_t MAX_BATCH = 1u << 20;
 };
 
 // Convenience: from a BitLocker volume source + recovery password, build the

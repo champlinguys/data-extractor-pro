@@ -44,6 +44,25 @@ static std::unique_ptr<Filesystem> mount(const std::shared_ptr<ImageSource>& img
     return fs;
 }
 
+// Build the reconstructed disk from a QLC+Optane pair. If the Optane image has
+// no decodable linear span, say why and carry on with the QLC alone rather than
+// refusing to run: on many modules the QLC is already current for everything
+// except recently written blocks, so a possibly-stale volume we can browse
+// beats no volume at all.
+static std::shared_ptr<ImageSource> reconstruct(std::shared_ptr<ImageSource> qlc,
+                                                std::shared_ptr<ImageSource> opt,
+                                                uint64_t hint) {
+    std::string why;
+    if (auto merged = de::optane::makeSpanMerge(qlc, opt, hint, &why))
+        return merged;
+    std::fprintf(stderr,
+                 "warning: Optane reconstruction unavailable (%s)\n"
+                 "         continuing on the QLC alone - blocks written shortly\n"
+                 "         before the failure may be stale or missing\n",
+                 why.c_str());
+    return qlc;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { usage(); return 2; }
 
@@ -57,8 +76,7 @@ int main(int argc, char** argv) {
             opt = std::make_shared<RawImageSource>(argv[3]);
         } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
         uint64_t hint = argc >= 5 ? std::strtoull(argv[4], nullptr, 10) * 512ull : UINT64_MAX;
-        auto merged = de::optane::makeSpanMerge(qlc, opt, hint);
-        if (!merged) { std::fprintf(stderr, "not a span-backed Optane device\n"); return 1; }
+        auto merged = reconstruct(qlc, opt, hint);
         for (auto& p : scanPartitions(merged)) {
             auto vol = p.asSource(merged);
             auto md = de::bitlocker::parseFve(*vol);
@@ -91,8 +109,7 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
         uint64_t hint = std::strtoull(argv[4], nullptr, 10) * 512ull;
         std::string recovery = argv[5];
-        auto merged = de::optane::makeSpanMerge(qlc, opt, hint);
-        if (!merged) { std::fprintf(stderr, "not a span-backed Optane device\n"); return 1; }
+        auto merged = reconstruct(qlc, opt, hint);
 
         for (auto& p : scanPartitions(merged)) {
             auto vol = p.asSource(merged);
@@ -113,7 +130,7 @@ int main(int argc, char** argv) {
             auto enc = vol->read(testOff, 512);
             uint8_t sec[512];
             std::memcpy(sec, enc.data(), 512);
-            de::bitlocker::aesXtsDecryptSector(*keys, testOff / 512, sec);
+            de::bitlocker::decryptSector(*keys, testOff / 512, sec);
             std::printf("decrypted volume offset %llu - ASCII preview:\n  ",
                         (unsigned long long)testOff);
             for (int i = 0; i < 96; ++i)
@@ -135,10 +152,13 @@ int main(int argc, char** argv) {
             opt = std::make_shared<RawImageSource>(argv[3]);
         } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
         uint64_t hint = std::strtoull(argv[4], nullptr, 10) * 512ull;
-        auto merged = de::optane::makeSpanMerge(qlc, opt, hint);
-        if (!merged) { std::fprintf(stderr, "not a span-backed Optane device\n"); return 1; }
+        auto merged = reconstruct(qlc, opt, hint);
         for (auto& p : scanPartitions(merged)) {
             auto vol = p.asSource(merged);
+            std::string note;
+            vol = de::bitlocker::reconcileVolumeSize(merged, p.firstByte, vol, &note);
+            if (!note.empty())
+                std::fprintf(stderr, "partition %d: %s\n", p.index, note.c_str());
             auto dec = de::bitlocker::unlockVolume(vol, argv[5]);
             if (!dec) continue;
             auto fs = detectFilesystem(dec);
@@ -223,8 +243,7 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
         uint64_t hint = UINT64_MAX;
         if (argc >= 5) hint = std::strtoull(argv[4], nullptr, 10) * 512ull;
-        auto merged = de::optane::makeSpanMerge(qlc, opt, hint);
-        if (!merged) { std::fprintf(stderr, "not a span-backed Optane device\n"); return 1; }
+        auto merged = reconstruct(qlc, opt, hint);
         std::printf("Reconstructed disk: %.2f GB (QLC %.2f GB + Optane span)\n",
                     merged->size() / 1e9, qlc->size() / 1e9);
         for (auto& p : scanPartitions(merged)) {

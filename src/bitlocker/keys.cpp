@@ -122,10 +122,11 @@ std::optional<VolumeKeys> unlockWithRecovery(const FveMetadata& md,
     return std::nullopt;
 }
 
-void aesXtsDecryptSector(const VolumeKeys& keys, uint64_t dataUnit,
-                         uint8_t* sector) {
+namespace {
+// AES-XTS: the FVEK holds key1||key2; the tweak is the little-endian data-unit
+// number. AES-XTS-128 => two 16-byte keys (32 total), AES-XTS-256 => 64.
+void xtsDecryptSector(const VolumeKeys& keys, uint64_t dataUnit, uint8_t* sector) {
     bool xts256 = keys.method == EncryptionMethod::AesXts256;
-    // XTS uses key1||key2. AES-XTS-128 => two 16-byte keys (32 total).
     size_t keyLen = xts256 ? 64 : 32;
     if (keys.fvek.size() < keyLen) return;
 
@@ -141,6 +142,73 @@ void aesXtsDecryptSector(const VolumeKeys& keys, uint64_t dataUnit,
         EVP_DecryptUpdate(ctx, out, &len, sector, 512);
     EVP_CIPHER_CTX_free(ctx);
     std::memcpy(sector, out, 512);
+}
+
+// AES-CBC (no diffuser): the per-sector IV is the FVEK-encrypted (AES-ECB) byte
+// offset of the sector, stored little-endian in a 16-byte block. The whole
+// sector is then AES-CBC decrypted with the FVEK. AES-CBC-128 uses a 16-byte
+// key, AES-CBC-256 a 32-byte key.
+void cbcDecryptSector(const VolumeKeys& keys, uint64_t dataUnit, uint8_t* sector) {
+    bool cbc256 = keys.method == EncryptionMethod::AesCbc256;
+    size_t keyLen = cbc256 ? 32 : 16;
+    if (keys.fvek.size() < keyLen) return;
+
+    // IV block: little-endian byte offset of this sector in the low 8 bytes.
+    uint8_t iv[16] = {};
+    uint64_t byteOffset = dataUnit * 512ull;
+    for (int i = 0; i < 8; ++i) iv[i] = (byteOffset >> (8 * i)) & 0xFF;
+
+    const EVP_CIPHER* ecb = cbc256 ? EVP_aes_256_ecb() : EVP_aes_128_ecb();
+    const EVP_CIPHER* cbc = cbc256 ? EVP_aes_256_cbc() : EVP_aes_128_cbc();
+    int len = 0;
+
+    // Encrypt the offset block with the FVEK (ECB) to derive the sector IV.
+    EVP_CIPHER_CTX* ectx = EVP_CIPHER_CTX_new();
+    if (!ectx) return;
+    if (EVP_EncryptInit_ex(ectx, ecb, nullptr, keys.fvek.data(), nullptr) == 1) {
+        EVP_CIPHER_CTX_set_padding(ectx, 0);
+        EVP_EncryptUpdate(ectx, iv, &len, iv, 16);
+    }
+    EVP_CIPHER_CTX_free(ectx);
+
+    // CBC-decrypt the sector with that IV.
+    EVP_CIPHER_CTX* dctx = EVP_CIPHER_CTX_new();
+    if (!dctx) return;
+    uint8_t out[512];
+    if (EVP_DecryptInit_ex(dctx, cbc, nullptr, keys.fvek.data(), iv) == 1) {
+        EVP_CIPHER_CTX_set_padding(dctx, 0);
+        EVP_DecryptUpdate(dctx, out, &len, sector, 512);
+    }
+    EVP_CIPHER_CTX_free(dctx);
+    std::memcpy(sector, out, 512);
+}
+} // namespace
+
+bool methodSupported(EncryptionMethod m) {
+    switch (m) {
+        case EncryptionMethod::AesXts128:
+        case EncryptionMethod::AesXts256:
+        case EncryptionMethod::AesCbc128:
+        case EncryptionMethod::AesCbc256:
+            return true;
+        default:  // the Elephant-diffuser CBC variants aren't implemented
+            return false;
+    }
+}
+
+void decryptSector(const VolumeKeys& keys, uint64_t dataUnit, uint8_t* sector) {
+    switch (keys.method) {
+        case EncryptionMethod::AesCbc128:
+        case EncryptionMethod::AesCbc256:
+            cbcDecryptSector(keys, dataUnit, sector);
+            break;
+        case EncryptionMethod::AesXts128:
+        case EncryptionMethod::AesXts256:
+            xtsDecryptSector(keys, dataUnit, sector);
+            break;
+        default:
+            break;  // unsupported method: leave ciphertext untouched
+    }
 }
 
 } // namespace de::bitlocker

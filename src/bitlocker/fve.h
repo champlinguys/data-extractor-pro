@@ -52,6 +52,11 @@ struct FveMetadata {
     // `headerBlockOffset`. Decrypted reads of the start must come from there.
     uint64_t headerBlockOffset = 0;
     uint64_t headerBlockSize = 0;
+    // Size of the encrypted volume in bytes, as recorded in the FVE metadata
+    // block header. This lives *inside* the volume, so unlike a partition table
+    // it cannot be stale relative to the volume it describes - which makes it
+    // the better authority when the two disagree.
+    uint64_t encryptedVolumeSize = 0;
 };
 
 // Parse FVE metadata given the volume (partition) source. Reads the BitLocker
@@ -60,5 +65,17 @@ struct FveMetadata {
 std::optional<FveMetadata> parseFve(ImageSource& volume);
 
 const char* methodName(EncryptionMethod m);
+
+// Reconcile a partition window against the BitLocker volume's own declared
+// size. On a disk whose partition table is a generation behind (an Optane
+// write-back cache that never flushed the final GPT write is the case that
+// motivated this), the table can describe a shorter volume than BitLocker
+// itself does, silently truncating the tail of the filesystem. Returns `vol`
+// unchanged when they agree, otherwise a window of the declared size. `note`,
+// if given, receives a description of any adjustment made.
+std::shared_ptr<ImageSource> reconcileVolumeSize(std::shared_ptr<ImageSource> parent,
+                                                 uint64_t baseByte,
+                                                 std::shared_ptr<ImageSource> vol,
+                                                 std::string* note = nullptr);
 
 } // namespace de::bitlocker

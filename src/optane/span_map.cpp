@@ -7,7 +7,12 @@ namespace de::optane {
 
 std::shared_ptr<ImageSource> makeSpanMerge(std::shared_ptr<ImageSource> qlc,
                                            std::shared_ptr<ImageSource> optane,
-                                           uint64_t cacheHintBytes) {
+                                           uint64_t cacheHintBytes,
+                                           std::string* why) {
+    auto fail = [&](const char* msg) -> std::shared_ptr<ImageSource> {
+        if (why) *why = msg;
+        return nullptr;
+    };
     // Optane offset 0 must be a filesystem/BitLocker boot record for the span
     // to be a linear volume copy. Its hidden-sectors field is the disk LBA the
     // span begins at.
@@ -15,7 +20,8 @@ std::shared_ptr<ImageSource> makeSpanMerge(std::shared_ptr<ImageSource> qlc,
     bool isVbr = std::memcmp(vbr.data() + 3, "-FVE-FS-", 8) == 0 ||
                  std::memcmp(vbr.data() + 3, "NTFS    ", 8) == 0;
     if (!isVbr || vbr[510] != 0x55 || vbr[511] != 0xAA)
-        return nullptr;
+        return fail("no linear span at Optane offset 0 (not a boot record) - "
+                    "this module caches through the mapping table only");
     uint64_t spanStart = rd32(&vbr[0x1C]); // NTFS/BDE hidden sectors
 
     // Span length = start of the Intel Cache metadata region (end of the span
