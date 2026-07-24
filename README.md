@@ -10,11 +10,21 @@ paired QLC-NAND image and Optane-cache image.
 
 ## Download
 Prebuilt Linux binaries are on the [Releases](../../releases) page - no building
-required:
-- **DataExtractorPro-x86_64.AppImage** (GUI). Download it, then
-  `chmod +x DataExtractorPro-x86_64.AppImage && ./DataExtractorPro-x86_64.AppImage`.
-  Qt and OpenSSL are bundled in, so there are no dependencies to install.
-- **de-cli-linux-x86_64.tar.gz** (the headless command-line tool).
+required. The latest version is **v0.3.0**.
+
+**GUI** (Qt and OpenSSL are bundled in, so there are no dependencies to install):
+```sh
+wget https://github.com/champlinguys/data-extractor-pro/releases/download/v0.3.0/DataExtractorPro-x86_64.AppImage
+chmod +x DataExtractorPro-x86_64.AppImage
+./DataExtractorPro-x86_64.AppImage
+```
+
+**Headless CLI**:
+```sh
+wget https://github.com/champlinguys/data-extractor-pro/releases/download/v0.3.0/de-cli-linux-x86_64.tar.gz
+tar xzf de-cli-linux-x86_64.tar.gz
+./de-cli
+```
 
 Prefer to build from source? See [Building](#building) below.
 
@@ -27,9 +37,12 @@ Status:
   and QLC is authoritative beyond it. Rare recently-written deep files can live
   in the Optane's hashed NV-cache (undecoded); these are a < 0.2 % residual not
   currently recovered.
-- **BitLocker decryption** - working: recovery password -> VMK -> FVEK ->
-  AES-XTS-128, browse/extract the decrypted NTFS. Validated byte-for-byte
-  against a reference recovery tool on a real Optane H10 case.
+- **BitLocker decryption** - working: recovery password -> VMK -> FVEK, then
+  AES-XTS-128/256 or AES-CBC-128/256 sector decryption, browse/extract the
+  decrypted NTFS. Enter the recovery key up front (Open Optane Set) or
+  right-click a locked BitLocker partition to unlock it in place. The AES-XTS
+  path is validated byte-for-byte against a reference recovery tool on a real
+  Optane H10 case; the Elephant-diffuser CBC variants are not yet supported.
 
 - **Classic HFS (pre-HFS+)** - working: the 1985-1998 Macintosh filesystem
   found on old Mac floppies and small disks, which mainstream tools (Sleuth
