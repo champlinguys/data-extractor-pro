@@ -1,6 +1,7 @@
 #include "partition/partition.h"
 #include "core/byte_reader.h"
 #include <array>
+#include <optional>
 
 namespace de {
 
@@ -37,32 +38,57 @@ std::string gptTypeName(const uint8_t* guid) {
     return zero ? "" : "Unknown GUID";
 }
 
-std::vector<Partition> scanGpt(const std::shared_ptr<ImageSource>& img,
-                               uint32_t sectorSize) {
-    std::vector<Partition> out;
-    auto hdr = img->read(sectorSize, sectorSize); // GPT header at LBA 1
+// The parts of a GPT header we need to locate and bound the entry array.
+struct GptHeader {
+    uint64_t entryLba = 2;
+    uint32_t numEntries = 128;
+    uint32_t entrySize = 128;
+    uint64_t firstUsable = 34;
+    uint64_t lastUsable = 0;
+};
+
+// Read and sanity-check the GPT header at `lba`. Rejects anything whose entry
+// array geometry is implausible, so a half-overwritten header can't send us
+// reading gigabytes of garbage.
+std::optional<GptHeader> readGptHeader(const std::shared_ptr<ImageSource>& img,
+                                       uint64_t lba, uint32_t sectorSize) {
+    auto hdr = img->read(lba * sectorSize, sectorSize);
+    if (std::memcmp(hdr.data(), "EFI PART", 8) != 0) return std::nullopt;
     de::Span h{hdr.data(), hdr.size()};
-    if (std::memcmp(hdr.data(), "EFI PART", 8) != 0)
-        return out;
+    GptHeader g;
+    g.firstUsable = h.u64(40);
+    g.lastUsable  = h.u64(48);
+    g.entryLba    = h.u64(72);
+    g.numEntries  = h.u32(80);
+    g.entrySize   = h.u32(84);
+    if (g.entrySize < 128 || g.entrySize > 4096) return std::nullopt;
+    if (g.numEntries == 0 || g.numEntries > 4096) return std::nullopt;
+    if (g.lastUsable < g.firstUsable) return std::nullopt;
+    if (g.entryLba == 0 || g.entryLba * sectorSize >= img->size()) return std::nullopt;
+    return g;
+}
 
-    uint64_t entryLba   = h.u64(72);
-    uint32_t numEntries = h.u32(80);
-    uint32_t entrySize  = h.u32(84);
-    if (entrySize < 128 || numEntries == 0 || numEntries > 4096)
-        return out;
-
-    uint64_t tableOff = entryLba * sectorSize;
-    auto table = img->read(tableOff, static_cast<size_t>(numEntries) * entrySize);
+// Parse one entry array. Entries outside [firstUsable, lastUsable] are dropped:
+// on a disk whose backup table has been partly overwritten (RST/Optane metadata
+// lives in those very sectors) the array still parses, but the clobbered slots
+// decode as absurd ranges and would otherwise show up as phantom partitions.
+std::vector<Partition> readGptEntries(const std::shared_ptr<ImageSource>& img,
+                                      uint64_t entryLba, const GptHeader& g,
+                                      uint32_t sectorSize, const char* scheme) {
+    std::vector<Partition> out;
+    auto table = img->read(entryLba * sectorSize,
+                           static_cast<size_t>(g.numEntries) * g.entrySize);
     int idx = 1;
-    for (uint32_t i = 0; i < numEntries; ++i) {
-        const uint8_t* e = table.data() + static_cast<size_t>(i) * entrySize;
+    for (uint32_t i = 0; i < g.numEntries; ++i) {
+        const uint8_t* e = table.data() + static_cast<size_t>(i) * g.entrySize;
         std::string type = gptTypeName(e);
         if (type.empty()) continue; // unused slot
         uint64_t firstLba = rd64(e + 32);
         uint64_t lastLba  = rd64(e + 40);
         if (lastLba < firstLba) continue;
+        if (firstLba < g.firstUsable || lastLba > g.lastUsable) continue;
         Partition p;
-        p.scheme = "GPT";
+        p.scheme = scheme;
         p.firstByte = firstLba * sectorSize;
         p.lengthBytes = (lastLba - firstLba + 1) * sectorSize;
         p.typeName = type;
@@ -70,6 +96,49 @@ std::vector<Partition> scanGpt(const std::shared_ptr<ImageSource>& img,
         out.push_back(std::move(p));
     }
     return out;
+}
+
+// Scan a GPT, tolerating a destroyed primary header.
+//
+// Windows/RST disks turn up with the header at LBA 1 zeroed while the entry
+// array at LBA 2 is intact and current - and, on an Optane-cached disk, with
+// the backup table at the end of the media partly overwritten by the Intel RST
+// metadata. So: take geometry from whichever header survives (primary, else
+// backup), then try both entry-array locations and keep whichever yields more
+// usable entries, preferring the primary array on a tie because it is the copy
+// the running system updates first.
+std::vector<Partition> scanGpt(const std::shared_ptr<ImageSource>& img,
+                               uint32_t sectorSize) {
+    const uint64_t lastLba = img->size() / sectorSize - 1;
+    auto primary = readGptHeader(img, 1, sectorSize);
+    auto backup  = readGptHeader(img, lastLba, sectorSize);
+
+    GptHeader g;
+    if (primary)      g = *primary;
+    else if (backup)  g = *backup;
+    else {
+        // Both headers gone. The entry array at LBA 2 may still be there, so
+        // fall back to the standard geometry every Windows/UEFI disk uses.
+        g.entryLba = 2;
+        g.numEntries = 128;
+        g.entrySize = 128;
+        g.firstUsable = 34;
+        g.lastUsable = lastLba >= 34 ? lastLba - 33 : 0;
+    }
+    const char* scheme = primary ? "GPT" : "GPT (recovered)";
+
+    // Candidate entry-array locations, best-first.
+    std::vector<uint64_t> candidates{2};
+    if (g.entryLba != 2) candidates.push_back(g.entryLba);
+    if (backup && backup->entryLba != 2 && backup->entryLba != g.entryLba)
+        candidates.push_back(backup->entryLba);
+
+    std::vector<Partition> best;
+    for (uint64_t lba : candidates) {
+        auto got = readGptEntries(img, lba, g, sectorSize, scheme);
+        if (got.size() > best.size()) best = std::move(got);
+    }
+    return best;
 }
 
 } // namespace
@@ -110,7 +179,11 @@ std::vector<Partition> scanPartitions(const std::shared_ptr<ImageSource>& img) {
             uint8_t type = e[4];
             uint32_t startLba = rd32(e + 8);
             uint32_t sectors  = rd32(e + 12);
-            if (type == 0 || sectors == 0) continue;
+            // 0xEE is the protective entry for a GPT we have already failed to
+            // read; reporting it as a partition covering the whole disk is
+            // worse than useless, so leave it out and let the whole-image
+            // fallback below speak instead.
+            if (type == 0 || type == 0xEE || sectors == 0) continue;
             Partition p;
             p.scheme = "MBR";
             p.firstByte = static_cast<uint64_t>(startLba) * sectorSize;

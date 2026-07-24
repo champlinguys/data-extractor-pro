@@ -5,6 +5,7 @@
 #include "partition/partition.h"
 #include "optane/span_map.h"
 #include "bitlocker/volume.h"
+#include "bitlocker/fve.h"
 
 #include <QApplication>
 #include <QFileDialog>
@@ -22,9 +23,11 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLineEdit>
+#include <QInputDialog>
 #include <QPushButton>
 #include <QDialogButtonBox>
 #include <QProgressDialog>
+#include <QMenu>
 #include <QTimer>
 #include <functional>
 #include <algorithm>
@@ -44,6 +47,7 @@ constexpr int RoleIsDir   = Qt::UserRole + 3;
 constexpr int RoleSize    = Qt::UserRole + 4;
 constexpr int RoleLoaded  = Qt::UserRole + 5;   // lazy-load guard
 constexpr int RoleName    = Qt::UserRole + 6;
+constexpr int RoleLocked  = Qt::UserRole + 7;   // partition is a locked BitLocker volume
 
 QString humanSize(uint64_t n) {
     const char* u[] = {"B", "KiB", "MiB", "GiB", "TiB"};
@@ -101,6 +105,9 @@ MainWindow::MainWindow() {
     connect(tree_, &QTreeWidget::itemExpanded, this, &MainWindow::onItemExpanded);
     connect(tree_, &QTreeWidget::itemSelectionChanged, this, &MainWindow::onItemSelected);
     connect(tree_, &QTreeWidget::itemChanged, this, &MainWindow::onItemChanged);
+    tree_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(tree_, &QTreeWidget::customContextMenuRequested,
+            this, &MainWindow::showTreeMenu);
 
     hex_ = new HexView;
 
@@ -221,12 +228,16 @@ void MainWindow::loadOptaneSet(const QString& qlcPath, const QString& optanePath
     // The merge + BitLocker key-stretch + reads over a slow image take several
     // seconds - do them on the worker so the UI never freezes.
     runOpen("Optane reconstruction", [this, qlc, opt, cacheHintBytes, key] {
-        auto merged = de::optane::makeSpanMerge(qlc, opt, cacheHintBytes);
+        std::string why;
+        auto merged = de::optane::makeSpanMerge(qlc, opt, cacheHintBytes, &why);
         if (!merged) {
-            openError_ = "Couldn't detect a span-backed Optane device.\n"
-                         "Check the Optane image, and if auto-scan is too slow, "
-                         "provide the Intel Cache start sector (from de-cli imsm).";
-            return;
+            // Not every Optane module has a linear span we can decode. Rather
+            // than refuse the case, open the QLC on its own and warn: it is
+            // usually current except for blocks written shortly before failure.
+            openWarning_ = "Couldn't reconstruct the Optane cache (" + why + ").\n\n"
+                           "Opening the QLC image on its own. Data written shortly "
+                           "before the failure may be stale or missing.";
+            merged = qlc;
         }
         openedSource_ = merged;
         openedVols_ = prepareVolumes(merged, key);
@@ -252,9 +263,21 @@ MainWindow::prepareVolumes(std::shared_ptr<ImageSource> source, const std::strin
     std::vector<PreparedVol> out;
     for (auto& p : scanPartitions(source)) {
         std::shared_ptr<ImageSource> vol = p.asSource(source);
+        // A BitLocker volume records its own size; prefer it over a partition
+        // table that may be a generation behind (see reconcileVolumeSize).
+        std::string note;
+        vol = de::bitlocker::reconcileVolumeSize(source, p.firstByte, vol, &note);
+        if (!note.empty())
+            openWarning_ += "Partition " + std::to_string(p.index) + ": " + note + "\n";
         QString fsName = QString::fromStdString(detectFilesystemName(*vol));
         if (!key.empty() && fsName.startsWith("BitLocker")) {
-            if (auto dec = de::bitlocker::unlockVolume(vol, key)) {
+            // A cipher we can't decrypt would only yield garbage, so check the
+            // method before trying the key (see methodSupported).
+            auto md = de::bitlocker::parseFve(*vol);
+            if (md && !de::bitlocker::methodSupported(md->method)) {
+                fsName = QString("BitLocker %1 (cipher not supported yet)")
+                             .arg(de::bitlocker::methodName(md->method));
+            } else if (auto dec = de::bitlocker::unlockVolume(vol, key)) {
                 vol = dec;
                 fsName = QString::fromStdString(detectFilesystemName(*vol))
                              + "  (BitLocker unlocked)";
@@ -270,6 +293,7 @@ MainWindow::prepareVolumes(std::shared_ptr<ImageSource> source, const std::strin
 void MainWindow::runOpen(const QString& label, std::function<void()> producer) {
     openDone_ = false;
     openError_.clear();
+    openWarning_.clear();
     openedSource_.reset();
     openedVols_.clear();
 
@@ -298,6 +322,8 @@ void MainWindow::runOpen(const QString& label, std::function<void()> producer) {
         QMessageBox::critical(this, "Open", QString::fromStdString(openError_));
         return;
     }
+    if (!openWarning_.empty())
+        QMessageBox::warning(this, "Open", QString::fromStdString(openWarning_));
     buildTree(openedVols_, label, openedSource_ ? openedSource_->size() : 0);
 }
 
@@ -321,19 +347,143 @@ void MainWindow::buildTree(const std::vector<PreparedVol>& vols, const QString& 
         item->setData(0, RoleKind, static_cast<int>(ItemKind::Partition));
         item->setData(0, RolePart, v.index);
         item->setData(0, RoleLoaded, false);
+        // Offer the right-click unlock only where a key can actually help: a
+        // locked volume or a wrong-key attempt. A "cipher not supported yet"
+        // row is a correct-key dead end, so it gets no unlock action.
+        bool unlockable = fsName.startsWith("BitLocker (encrypted)") ||
+                          fsName.startsWith("BitLocker (unlock failed");
+        item->setData(0, RoleLocked, unlockable);
+        if (unlockable)
+            item->setToolTip(0, "Locked BitLocker volume - right-click to enter "
+                                "the recovery key");
         // Add the lazy-load placeholder (what gives the row its expand arrow)
-        // for any filesystem detectFilesystem() can actually mount - i.e.
-        // anything other than a stub label ("... not yet implemented"), an
-        // unrecognised volume, or BitLocker still locked/failed to unlock.
+        // only for a filesystem detectFilesystem() can mount: not a stub label
+        // ("... not yet implemented"), not an unrecognised volume, and not any
+        // BitLocker row that isn't actually unlocked (locked, wrong key, or a
+        // cipher we can't decrypt).
+        bool bitlockerNotBrowsable =
+            fsName.startsWith("BitLocker") && !fsName.contains("unlocked");
         bool browsable = !fsName.contains("not yet implemented") &&
                           fsName != "Unknown" &&
-                          !fsName.startsWith("BitLocker (encrypted)") &&
-                          !fsName.startsWith("BitLocker (unlock failed");
+                          !bitlockerNotBrowsable;
         if (browsable)
             item->addChild(new QTreeWidgetItem({QString("...")}));
     }
     status_->setText(QString("%1 - %2, %3 partition(s)")
                          .arg(label).arg(humanSize(totalSize)).arg(vols.size()));
+}
+
+void MainWindow::showTreeMenu(const QPoint& pos) {
+    QTreeWidgetItem* item = tree_->itemAt(pos);
+    if (!item) return;
+    // Only partition rows carry an unlock action, and only while still locked.
+    auto kind = static_cast<ItemKind>(item->data(0, RoleKind).toInt());
+    if (kind != ItemKind::Partition) return;
+
+    QMenu menu(this);
+    if (item->data(0, RoleLocked).toBool()) {
+        QAction* unlock = menu.addAction("Unlock BitLocker...");
+        connect(unlock, &QAction::triggered, this,
+                [this, item] { unlockBitLockerItem(item); });
+    }
+    if (!menu.isEmpty())
+        menu.exec(tree_->viewport()->mapToGlobal(pos));
+}
+
+void MainWindow::unlockBitLockerItem(QTreeWidgetItem* partitionItem) {
+    int part = partitionItem->data(0, RolePart).toInt();
+    auto vit = volumes_.find(part);
+    if (vit == volumes_.end() || !vit->second) return;
+
+    bool ok = false;
+    QString key = QInputDialog::getText(
+        this, "Unlock BitLocker",
+        "Enter the 48-digit BitLocker recovery key for this volume:",
+        QLineEdit::Normal, QString(), &ok);
+    key = key.trimmed();
+    if (!ok || key.isEmpty()) return;
+
+    // Key stretching (~1M SHA-256 rounds) plus reads over a slow (possibly
+    // reconstructed Optane) image can take several seconds, so run the unlock on
+    // a worker thread behind a modal busy dialog - same pattern as runOpen - to
+    // keep the event loop responsive instead of freezing the window.
+    std::shared_ptr<ImageSource> enc = vit->second;
+    std::string keyStd = key.toStdString();
+    std::shared_ptr<ImageSource> dec;
+    bool cipherSupported = true;   // set from the volume's declared method
+    std::string cipherName;
+    std::atomic<bool> done{false};
+
+    QProgressDialog progress("Deriving the key and unlocking the volume...\n"
+                             "This can take a moment.", QString(), 0, 0, this);
+    progress.setWindowTitle("Unlocking");
+    progress.setWindowModality(Qt::ApplicationModal);
+    progress.setCancelButton(nullptr);   // the unlock isn't interruptible
+    progress.setMinimumDuration(0);
+
+    std::thread worker([&] {
+        // The cipher is a property of the volume, independent of the key: even a
+        // correct key can't yield readable data for a method we can't decrypt
+        // (e.g. the Elephant-diffuser CBC variants), so note it up front.
+        if (auto md = de::bitlocker::parseFve(*enc)) {
+            cipherName = de::bitlocker::methodName(md->method);
+            cipherSupported = de::bitlocker::methodSupported(md->method);
+        }
+        dec = de::bitlocker::unlockVolume(enc, keyStd);
+        done = true;
+    });
+    QTimer timer;
+    connect(&timer, &QTimer::timeout, this, [&] {
+        if (done.load()) progress.accept();
+    });
+    timer.start(80);
+    progress.exec();
+    timer.stop();
+    worker.join();
+
+    if (!dec) {
+        QMessageBox::warning(this, "Unlock BitLocker",
+            "Could not unlock this volume. Check the recovery key and try again.\n\n"
+            "(The key must be the 48-digit recovery key, in eight groups of six "
+            "digits.)");
+        return;
+    }
+
+    if (!cipherSupported) {
+        // Key was right (dec is non-null), but this build can't decrypt the
+        // volume's cipher, so its plaintext would be garbage. Say so plainly and
+        // mark the row rather than presenting an empty/unreadable filesystem.
+        QString cn = QString::fromStdString(cipherName);
+        QMessageBox::warning(this, "Unlock BitLocker",
+            QString("The recovery key is correct, but this volume uses %1, which "
+                    "this build cannot decrypt yet.\n\nSupport for that cipher is "
+                    "still pending.").arg(cn));
+        partitionItem->setData(0, RoleLocked, false);   // retrying won't help
+        partitionItem->setToolTip(0, QString());
+        QString typeName = QString(partitionItem->text(0)).section('(', 0, 0).trimmed();
+        partitionItem->setText(0, QString("%1  (BitLocker %2 - cipher not supported yet)")
+                                      .arg(typeName).arg(cn));
+        return;
+    }
+
+    // Swap the decrypted view in, drop any stale mount, and turn the row into a
+    // browsable one with a fresh lazy placeholder.
+    volumes_[part] = dec;
+    mounts_.erase(part);
+    partitionItem->setData(0, RoleLocked, false);
+    partitionItem->setData(0, RoleLoaded, false);
+    partitionItem->setToolTip(0, QString());
+
+    QString fsName = QString::fromStdString(detectFilesystemName(*dec))
+                         + "  (BitLocker unlocked)";
+    QString typeName = QString(partitionItem->text(0)).section('(', 0, 0).trimmed();
+    partitionItem->setText(0, QString("%1  (%2)").arg(typeName).arg(fsName));
+
+    while (partitionItem->childCount() > 0)
+        delete partitionItem->takeChild(0);
+    partitionItem->addChild(new QTreeWidgetItem({QString("...")}));
+    partitionItem->setExpanded(true);
+    status_->setText("BitLocker volume unlocked.");
 }
 
 Filesystem* MainWindow::mountFor(QTreeWidgetItem* partitionItem) {

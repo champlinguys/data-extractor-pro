@@ -33,8 +33,14 @@ private slots:
     void onItemSelected();
     void onItemChanged(QTreeWidgetItem* item, int column);
     void exportSelected();
+    // Right-click menu on the tree: offers "Unlock BitLocker..." on a still-
+    // locked BitLocker partition row.
+    void showTreeMenu(const QPoint& pos);
 
 private:
+    // Prompt for a recovery key and, if it unlocks `partitionItem`'s volume,
+    // swap in the decrypted source and turn the row into a browsable one.
+    void unlockBitLockerItem(QTreeWidgetItem* partitionItem);
     void loadImage(const QString& path);
     // Reconstruct a QLC+Optane pair and (optionally) unlock BitLocker, then
     // browse the result. `cacheHintBytes` is the Intel Cache region offset, or
@@ -93,6 +99,7 @@ private:
     std::shared_ptr<de::ImageSource> openedSource_;
     std::vector<PreparedVol> openedVols_;
     std::string openError_;
+    std::string openWarning_;  // non-fatal: shown, then the open continues
 
     QTreeWidget* tree_ = nullptr;
     HexView* hex_ = nullptr;

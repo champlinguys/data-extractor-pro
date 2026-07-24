@@ -278,3 +278,68 @@ cache metadata region:
 These case-specific scripts are not included in this repository. The structural
 findings above (IMSM layout, the linear span, and the 16-byte record format) are
 device-independent and sufficient to re-derive them.
+
+---
+
+# Variant B: a module with NO linear span (second unit analysed)
+
+A second Optane set (HP Envy, same H10 geometry: QLC 512,110,190,592 B /
+1,000,215,216 sectors, Optane 29,260,513,280 B) turned out to use a
+**completely different on-media layout**. Everything above describes what is
+now "variant A". Do not assume a new module matches it.
+
+## What is NOT there
+
+- **No linear span.** Optane byte 0 is not a boot record - the first ~7 MiB are
+  zero apart from four bytes at 0x1B8. `makeSpanMerge()` therefore (correctly)
+  declines; the tool now falls back to the QLC with a warning instead of
+  refusing to open the case.
+- **No `Intel Raid ISM Cfg Sig.` and no `Intel IMSM NV Cache Cfg. Sig.` anywhere
+  in the 29 GB Optane image** (verified by a full-image byte scan). This is why
+  third-party tools report "no Optane cache found" on such a unit - there is no
+  signature for them to anchor on.
+- The 28 `-FVE-FS-` hits in the Optane image are all **cached file data** (they
+  sit inside a Windows binary's string table, next to `PBKDF2_HMAC_SHA256`,
+  `ReFS`, `EXFAT`, `NTFS`), not cached volume headers.
+
+## What IS there
+
+- **The IMSM super lives on the QLC, at `size - 1024`** (i.e. the second-to-last
+  sector), not on the Optane - and its first signature byte is zeroed, so it
+  reads as `\0ntel Raid ISM Cfg Sig. 1.0.00`. `num_disks` and `num_raid_devs`
+  read 0 as well, though `mpb_size` = 264 = 0xD8 + 48 accounts for exactly one
+  disk. The structure is otherwise intact and parses at the documented offsets:
+  disk[0] serial `PG144401R0512A-1`, `total_blocks` = 1,000,215,216 (the QLC),
+  and the `imsm_dev` that follows at 0xD8+48 gives size 1,000,210,695. The
+  string `Cache_Volume` appears later in the same block (offset 0x1A0, past
+  `mpb_size`); which field owns it is not yet pinned down. RST version string is
+  **1.0.00**, not 1.4.01.
+- **A mapping/journal region at roughly 0x680000 .. 0x10000000**, then cached
+  data (high entropy) beyond it, with large zero holes further in.
+- Each 512-byte block of that region starts `[u32 0x0338][u32 count][u32 0]`
+  followed by **variable-length records whose length is chosen by a leading
+  tag**: tag `0x00008200` introduces a 12-byte record `[tag][u32 a][u32 b]`
+  where `a` steps like a disk LBA and `b` is a strictly incrementing
+  Optane-side counter; tags such as `0x0180FFFF`, `0x0100FFFF`, `0x00020000`
+  introduce 8-byte records `[tag][u32 lba]`. It reads as an **operation log**,
+  not a flat table - which fits an append-only write-back cache.
+- **A structure at the far end of the device** (from ~`0x6CFE00000`) with magic
+  `0xCAFE1150`, holding pairs `[u32 a][u32 ~a]` (the two words always sum to
+  0xFFFFFFFF), `a` ascending - most likely a free/erase list with a complement
+  check, not a mapping.
+
+## Practical consequence (this unit)
+
+Unlike variant A, **the QLC alone is very nearly complete**: partition 3 already
+holds the current `-FVE-FS-` BitLocker header, and both FVE metadata copies
+named by that header (partition-relative `0x504B0000` and `0x86854000`) are
+present and valid on the QLC. Reconstruction is not required to unlock.
+
+The one thing genuinely missing from the QLC is the **primary GPT header at
+LBA 1, which is all zeros** while the entry array at LBA 2 is intact and
+current - the classic signature of a block that was written into the cache and
+never flushed. The backup GPT at the last sector survives but its entry array is
+stale (it still describes a 78 GB partition 3) and partly overwritten by the
+RST metadata that shares those sectors. `scanPartitions()` now recovers from
+this: geometry from whichever header survives, entries from whichever candidate
+array (LBA 2 or the header's) yields more in-range entries, preferring LBA 2.

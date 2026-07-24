@@ -36,9 +36,17 @@ aesCcmDecrypt(const std::vector<uint8_t>& key, const uint8_t nonce[12],
 std::optional<VolumeKeys> unlockWithRecovery(const FveMetadata& md,
                                              const std::string& recoveryPassword);
 
-// AES-XTS decrypt one 512-byte data unit in place. `dataUnit` is the unit
-// number (volume byte offset / 512). Uses key1||key2 from the FVEK.
-void aesXtsDecryptSector(const VolumeKeys& keys, uint64_t dataUnit,
-                         uint8_t* sector /*512 bytes*/);
+// Decrypt one 512-byte sector in place, dispatching on the volume's encryption
+// method. `dataUnit` is the sector number (physical byte offset / 512):
+//   - AES-XTS: `dataUnit` is the XTS tweak / data-unit number.
+//   - AES-CBC: the IV is AES-ECB(FVEK) of the sector's byte offset (dataUnit*512).
+// The Elephant-diffuser CBC variants (0x8000/0x8001) are not yet supported.
+void decryptSector(const VolumeKeys& keys, uint64_t dataUnit,
+                   uint8_t* sector /*512 bytes*/);
+
+// Whether the engine can actually decrypt this method's sectors. parseFve/
+// unlockWithRecovery succeed regardless of method (they only unwrap keys), so
+// callers use this to avoid presenting a garbage "decrypted" volume.
+bool methodSupported(EncryptionMethod m);
 
 } // namespace de::bitlocker

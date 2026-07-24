@@ -1,6 +1,7 @@
 #include "bitlocker/fve.h"
 #include "core/byte_reader.h"
 #include <cstring>
+#include <cstdio>
 
 namespace de::bitlocker {
 
@@ -117,6 +118,8 @@ std::optional<FveMetadata> parseFve(ImageSource& volume) {
     if (metaSize < headerSize || 0x40 + metaSize > blk.size()) return std::nullopt;
 
     FveMetadata md;
+    // Metadata *block* header field, not the metadata header at +0x40.
+    md.encryptedVolumeSize = rd64(&blk[0x10]);
     std::memcpy(md.volumeGuid, h + 0x10, 16);
     md.method = static_cast<EncryptionMethod>(rd16(h + 0x24));
 
@@ -139,6 +142,33 @@ std::optional<FveMetadata> parseFve(ImageSource& volume) {
         }
     });
     return md;
+}
+
+std::shared_ptr<ImageSource> reconcileVolumeSize(std::shared_ptr<ImageSource> parent,
+                                                 uint64_t baseByte,
+                                                 std::shared_ptr<ImageSource> vol,
+                                                 std::string* note) {
+    auto md = parseFve(*vol);
+    if (!md || md->encryptedVolumeSize == 0) return vol;
+    uint64_t declared = md->encryptedVolumeSize;
+    if (declared == vol->size()) return vol;
+    // Never run off the end of the media, whatever the header claims.
+    if (baseByte >= parent->size()) return vol;
+    uint64_t avail = parent->size() - baseByte;
+    uint64_t want = declared < avail ? declared : avail;
+    if (want == vol->size()) return vol;
+    if (note) {
+        char buf[256];
+        std::snprintf(buf, sizeof buf,
+                      "partition table says %llu bytes, BitLocker declares %llu; "
+                      "using %llu (%+lld sectors)",
+                      (unsigned long long)vol->size(), (unsigned long long)declared,
+                      (unsigned long long)want,
+                      (long long)((want - vol->size()) / 512));
+        *note = buf;
+    }
+    return std::make_shared<SubImageSource>(parent, baseByte, want,
+                                            "BitLocker volume (size from FVE)");
 }
 
 } // namespace de::bitlocker

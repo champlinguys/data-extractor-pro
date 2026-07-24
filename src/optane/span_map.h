@@ -1,5 +1,6 @@
 #pragma once
 #include <memory>
+#include <string>
 #include "optane/optane_merge.h"
 #include "core/image_source.h"
 
@@ -43,8 +44,11 @@ private:
 // spanLen = the IMSM Intel-Cache region offset (end of the span component).
 // `cacheHintBytes` is the Intel Cache region offset if known, to skip the slow
 // full-device IMSM signature scan.
+// `why`, if given, receives a human-readable reason when detection fails, so
+// the caller can tell the user whether to fall back to a QLC-only view.
 std::shared_ptr<ImageSource> makeSpanMerge(std::shared_ptr<ImageSource> qlc,
                                            std::shared_ptr<ImageSource> optane,
-                                           uint64_t cacheHintBytes = UINT64_MAX);
+                                           uint64_t cacheHintBytes = UINT64_MAX,
+                                           std::string* why = nullptr);
 
 } // namespace de::optane
