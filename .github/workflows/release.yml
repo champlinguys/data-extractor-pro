@@ -72,6 +72,48 @@ jobs:
       - name: Package CLI
         run: tar czf de-cli-linux-x86_64.tar.gz -C build de-cli
 
+      # Release notes = the annotated tag's message, over the standing
+      # download boilerplate. Every release used to ship the boilerplate alone,
+      # so the notes never said what had changed. Write the tag message like
+      # release notes and it becomes them:
+      #   git tag -a v0.5.0 -m "v0.5.0" -m "- what changed"
+      - name: Compose release notes
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          # The tag object itself may not be in a shallow checkout.
+          git fetch --force --tags --depth=1 origin \
+            "refs/tags/$TAG:refs/tags/$TAG" 2>/dev/null || true
+          # Only an annotated tag carries a message of its own: on a
+          # lightweight tag %(contents) silently yields the *commit* message,
+          # which would ship a stray commit subject as the release notes.
+          notes=""
+          if [ "$(git for-each-ref "refs/tags/$TAG" --format='%(objecttype)')" \
+               = tag ]; then
+            # Subject is just the version, duplicating the release title, so
+            # prefer the body and fall back to the whole message.
+            notes=$(git tag -l --format='%(contents:body)' "$TAG")
+            if [ -z "${notes//[[:space:]]/}" ]; then
+              notes=$(git tag -l --format='%(contents)' "$TAG")
+            fi
+          fi
+          # 'if', not '&&': GitHub runs this under 'bash -e', where a bare
+          # failing test would abort the job on a tag with no message.
+          {
+            if [ -n "${notes//[[:space:]]/}" ]; then printf '%s\n\n' "$notes"; fi
+            cat <<'BOILERPLATE'
+          Prebuilt binaries for Linux x86_64.
+
+          - **DataExtractorPro-x86_64.AppImage** - the GUI. Download, then:
+            `chmod +x DataExtractorPro-x86_64.AppImage && ./DataExtractorPro-x86_64.AppImage`
+            (Qt and OpenSSL are bundled; no dependencies to install.)
+          - **de-cli-linux-x86_64.tar.gz** - the headless command-line tool.
+
+          See RECOVERY.md for the full imaging-to-export walkthrough.
+          BOILERPLATE
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -81,12 +123,4 @@ jobs:
           files: |
             DataExtractorPro-x86_64.AppImage
             de-cli-linux-x86_64.tar.gz
-          body: |
-            Prebuilt binaries for Linux x86_64.
-
-            - **DataExtractorPro-x86_64.AppImage** - the GUI. Download, then:
-              `chmod +x DataExtractorPro-x86_64.AppImage && ./DataExtractorPro-x86_64.AppImage`
-              (Qt and OpenSSL are bundled; no dependencies to install.)
-            - **de-cli-linux-x86_64.tar.gz** - the headless command-line tool.
-
-            See RECOVERY.md for the full imaging-to-export walkthrough.
+          body_path: RELEASE_NOTES.md
