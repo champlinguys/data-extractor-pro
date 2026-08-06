@@ -8,6 +8,18 @@
 
 namespace de {
 
+// Object timestamps, normalised to nanoseconds since the Unix epoch so the
+// export path never has to know which filesystem they came from. 0 means
+// "unknown" - the exporter leaves the corresponding attribute alone rather
+// than stamping 1970 onto the file.
+struct FsTimes {
+    int64_t mtime = 0;   // last data modification
+    int64_t crtime = 0;  // creation / birth
+    int64_t atime = 0;   // last access
+
+    bool any() const { return mtime || crtime || atime; }
+};
+
 // One entry in a filesystem tree. `id` is the filesystem-native identifier
 // (for NTFS, the MFT record number) that the parser uses to re-locate the
 // object on demand, so the GUI can browse lazily without holding the whole
@@ -18,7 +30,10 @@ struct FsNode {
     bool isDir = false;
     bool isDeleted = false;   // recovered from an unallocated record
     uint64_t size = 0;
-    int64_t mtime = 0;        // filesystem-native timestamp, 0 if unknown
+    FsTimes times;            // cheap timestamps captured while listing
+
+    // Kept for convenience: the modification time, in Unix nanoseconds.
+    int64_t mtime() const { return times.mtime; }
 
     bool operator==(const FsNode& o) const { return id == o.id && name == o.name; }
 };
@@ -54,6 +69,15 @@ public:
     // Resource fork of a file, or empty if none/not applicable. Default is
     // empty so existing filesystems (NTFS) need no changes; HFS overrides it.
     virtual std::vector<uint8_t> readResourceFork(const FsNode& /*file*/) { return {}; }
+
+    // Authoritative timestamps for a node, used by the export path so restored
+    // files carry the dates they had on the original volume. The default hands
+    // back what listDir already captured; NTFS overrides it to read
+    // $STANDARD_INFORMATION, which is what Explorer and timeline tools show
+    // (the $FILE_NAME copy in the directory index goes stale after a rename).
+    // May cost an extra read per file, so callers should use it per exported
+    // object, not per browsed row.
+    virtual FsTimes fileTimes(const FsNode& node) { return node.times; }
 };
 
 // Sniff the volume and return a mounted Filesystem, or nullptr if unrecognised.

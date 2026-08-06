@@ -124,6 +124,8 @@ BitLocker volume are all just byte sources. The filesystem parsers only ever see
 - Directory enumeration via the `$INDEX_ROOT` + `$INDEX_ALLOCATION` B-tree,
   collapsing DOS 8.3 aliases and preserving Unicode names
 - Full-file read/export honouring the real data size
+- `$STANDARD_INFORMATION` timestamps, so exports keep the dates the files had
+  on the original volume (see [Timestamps on export](#timestamps-on-export))
 
 Verified end-to-end against `mkntfs`-generated images (resident files,
 multi-run 3 MB file extracted byte-for-byte, subdirectories, Unicode, and an
@@ -142,6 +144,29 @@ NTFS-in-GPT-partition layout).
 - Exports **both forks**: data fork as the file, resource fork as a
   `<name>.rsrc` sidecar (via `Filesystem::readResourceFork`, default-empty
   for filesystems without forks)
+
+### Timestamps on export
+
+Exported files and folders are given the **modified and accessed dates recorded
+on the source volume** instead of the time of extraction, so a recovery keeps a
+sane timeline when the customer uploads it to cloud storage. On by default;
+turn it off under *Preferences -> Export -> Timestamps*.
+
+- **NTFS** reads `$STANDARD_INFORMATION` per exported object - the same values
+  Explorer and timeline tools show. (The `$FILE_NAME` copy in the directory
+  index is cheaper and is what the browser shows, but it goes stale after a
+  rename, so it is not what gets written out.)
+- **Classic HFS** uses the catalog's modification date. These are whole seconds
+  in the Mac's *local* time with no stored UTC offset, so they are carried
+  across as-is. HFS records no access time; the modification time is used for
+  both.
+- Directories are stamped **after** their contents, since writing children
+  bumps a directory's own mtime.
+- **Creation dates are not restored**: Linux has no portable syscall to set a
+  birth time. They are parsed and carried through the model, so a future
+  Windows build or a sidecar manifest can use them.
+- A file whose source timestamp is missing (0) is left with its extraction
+  date rather than being stamped with 1970.
 
 ## Roadmap
 

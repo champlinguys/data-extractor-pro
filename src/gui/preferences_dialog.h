@@ -30,5 +30,6 @@ private:
     QComboBox* collision_ = nullptr;
     QLineEdit* exportDir_ = nullptr;
     QComboBox* preview_ = nullptr;
+    QCheckBox* keepTimes_ = nullptr;
     QCheckBox* rememberOptane_ = nullptr;
 };

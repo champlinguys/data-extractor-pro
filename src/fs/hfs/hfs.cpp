@@ -16,6 +16,14 @@ int64_t hfsDateToUnix(uint32_t v) {
     return static_cast<int64_t>(v) - HFS_TO_UNIX_EPOCH_DELTA;
 }
 
+// Same conversion, in the nanoseconds-since-Unix-epoch unit FsTimes uses.
+// Classic HFS dates are whole seconds in the Mac's *local* time; there is no
+// stored offset to undo, so they are exported as-is.
+int64_t hfsDateToUnixNs(uint32_t v) {
+    if (v == 0) return 0;
+    return hfsDateToUnix(v) * 1000000000ll;
+}
+
 // MacRoman -> Unicode codepoint table for bytes 0x80-0xFF (0x00-0x7F is ASCII).
 constexpr char32_t kMacRomanHigh[128] = {
     0x00C4,0x00C5,0x00C7,0x00C9,0x00D1,0x00D6,0x00DC,0x00E1,
@@ -352,7 +360,10 @@ FsNode HfsFilesystem::toFsNode(const CatEntry& e) const {
     n.name = e.name;
     n.isDir = e.isDir;
     n.size = e.isDir ? 0 : e.dataLen;
-    n.mtime = hfsDateToUnix(static_cast<uint32_t>(e.modDate));
+    // Classic HFS records no access time, so atime stays 0 and the exporter
+    // falls back to the modification time.
+    n.times.mtime  = hfsDateToUnixNs(static_cast<uint32_t>(e.modDate));
+    n.times.crtime = hfsDateToUnixNs(static_cast<uint32_t>(e.createDate));
     return n;
 }
 

@@ -75,6 +75,26 @@ bool applyFixup(std::vector<uint8_t>& rec, uint32_t sectorSize) {
     return true;
 }
 
+// NTFS stores time as 100-nanosecond ticks since 1601-01-01 UTC; convert to
+// nanoseconds since the Unix epoch. 0 (and the 1601 epoch itself) means "not
+// set", which we pass through as 0 so the exporter leaves the attribute alone.
+constexpr int64_t FILETIME_UNIX_DELTA = 116444736000000000ll; // ticks, 1601->1970
+int64_t filetimeToUnixNs(uint64_t ft) {
+    if (ft == 0) return 0;
+    return (static_cast<int64_t>(ft) - FILETIME_UNIX_DELTA) * 100;
+}
+
+// Timestamp block shared by $STANDARD_INFORMATION and the $FILE_NAME key: four
+// FILETIMEs at +0x00 creation, +0x08 data modification, +0x10 MFT-record
+// modification, +0x18 last access.
+FsTimes readTimeBlock(const uint8_t* p) {
+    FsTimes t;
+    t.crtime = filetimeToUnixNs(rd64(p + 0x00));
+    t.mtime  = filetimeToUnixNs(rd64(p + 0x08));
+    t.atime  = filetimeToUnixNs(rd64(p + 0x18));
+    return t;
+}
+
 // Minimal UTF-16LE -> UTF-8 for filenames (handles the BMP plus surrogate
 // pairs). Good enough for display and export path names.
 std::string utf16leToUtf8(const uint8_t* p, size_t chars) {
@@ -286,6 +306,24 @@ NtfsFilesystem::collectAttributes(const std::vector<uint8_t>& baseRec, uint64_t 
     return attrs;
 }
 
+FsTimes NtfsFilesystem::fileTimes(const FsNode& node) {
+    auto rec = readMftRecord(node.id);
+    if (rec.empty()) return node.times;      // fall back to the index copy
+    FsTimes t;
+    bool got = false;
+    forEachAttribute(rec, [&](const uint8_t* a, uint32_t len) {
+        if (rd32(a) != ATTR_STANDARD_INFO) return false;
+        if (a[8] != 0) return false;         // $STANDARD_INFORMATION is resident
+        uint32_t vlen = rd32(a + 16);
+        uint16_t voff = rd16(a + 20);
+        if (voff + 0x20u > len || vlen < 0x20) return false;
+        t = readTimeBlock(a + voff);
+        got = true;
+        return true;
+    });
+    return got ? t : node.times;
+}
+
 std::vector<FsNode> NtfsFilesystem::listDir(const FsNode& dir) {
     std::vector<FsNode> out;
     auto rec = readMftRecord(dir.id);
@@ -319,7 +357,11 @@ std::vector<FsNode> NtfsFilesystem::listDir(const FsNode& dir) {
                     uint32_t fnFlags = rd32(key + 0x38);
                     child.isDir = (fnFlags & 0x10000000u) != 0; // FILE_ATTR_DIRECTORY
                     child.size = rd64(key + 0x30);              // real size
-                    child.mtime = static_cast<int64_t>(rd64(key + 0x18));
+                    // $FILE_NAME times follow the 8-byte parent reference.
+                    // Cheap (they are already in the index block) but they can
+                    // be stale, so the export path re-reads
+                    // $STANDARD_INFORMATION via fileTimes().
+                    child.times = readTimeBlock(key + 0x08);
                     if (!child.name.empty() && child.name != ".")
                         out.push_back(std::move(child));
                 }

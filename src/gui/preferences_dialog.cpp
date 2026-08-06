@@ -89,6 +89,14 @@ PreferencesDialog::PreferencesDialog(QWidget* parent) : QDialog(parent) {
         if (!d.isEmpty()) exportDir_->setText(d);
     });
     ef->addRow("Default export folder:", dirRow);
+
+    keepTimes_ = new QCheckBox("Keep original file dates");
+    keepTimes_->setToolTip(
+        "Give exported files the modified/accessed dates recorded on the source\n"
+        "volume (the MFT or catalog) instead of the time of extraction, so the\n"
+        "recovery keeps a sane timeline once it is uploaded to cloud storage.\n"
+        "Creation dates cannot be set on Linux and are not restored.");
+    ef->addRow("Timestamps:", keepTimes_);
     tabs->addTab(exp, "Export");
 
     // ---- Reading ----
@@ -132,6 +140,7 @@ void PreferencesDialog::loadFromPrefs() {
         p.collision == Collision::Overwrite ? "overwrite" :
         p.collision == Collision::Skip ? "skip" : "rename"));
     exportDir_->setText(p.defaultExportDir);
+    keepTimes_->setChecked(p.preserveTimestamps);
 
     int pi = preview_->findData(p.previewKiB);
     preview_->setCurrentIndex(pi < 0 ? 1 : pi);
@@ -157,6 +166,7 @@ void PreferencesDialog::commit() {
     p.collision = c == "overwrite" ? Collision::Overwrite :
                   c == "skip" ? Collision::Skip : Collision::Rename;
     p.defaultExportDir = exportDir_->text();
+    p.preserveTimestamps = keepTimes_->isChecked();
     p.previewKiB = preview_->currentData().toInt();
     p.rememberOptanePaths = rememberOptane_->isChecked();
     savePrefs();

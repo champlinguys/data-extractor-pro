@@ -35,6 +35,10 @@ struct Prefs {
     HashKind hashOnExport = HashKind::None;
     Collision collision = Collision::Rename;
     int exportBufferMiB = 4;
+    // Give exported files the dates they had on the source volume instead of
+    // the time of extraction, so recovered data lands in cloud storage with a
+    // sane timeline. On by default.
+    bool preserveTimestamps = true;
     QString defaultExportDir;             // empty => ask each time / last used
 
     // Reading

@@ -2,6 +2,7 @@
 // and export files. Handy for scripting and for verifying the engine without
 // the GUI.
 #include "core/image_source.h"
+#include "core/file_times.h"
 #include "partition/partition.h"
 #include "fs/filesystem.h"
 #include "optane/imsm.h"
@@ -197,7 +198,11 @@ int main(int argc, char** argv) {
                             std::string safe = c.name;
                             for (auto& ch : safe) if (ch == '/') ch = '_';
                             std::string cp = path + "/" + safe;
-                            if (c.isDir) rec(c.id, cp);
+                            if (c.isDir) {
+                                rec(c.id, cp);
+                                // After its contents, which bump its mtime.
+                                de::applyFileTimes(cp, fs->fileTimes(c));
+                            }
                             else {
                                 std::ofstream os(cp, std::ios::binary);
                                 fs->readFileStream(c, [&](const uint8_t* d, size_t n) {
@@ -206,12 +211,19 @@ int main(int argc, char** argv) {
                                     bytes += n; return static_cast<bool>(os);
                                 });
                                 ++files;
+                                os.close();
+                                de::FsTimes t = fs->fileTimes(c);
                                 if (auto rsrc = fs->readResourceFork(c); !rsrc.empty()) {
                                     std::ofstream rs(cp + ".rsrc", std::ios::binary);
                                     rs.write(reinterpret_cast<const char*>(rsrc.data()),
                                              static_cast<std::streamsize>(rsrc.size()));
                                     bytes += rsrc.size();
+                                    rs.close();
+                                    de::applyFileTimes(cp + ".rsrc", t);
                                 }
+                                // Restore the source dates, so a scripted export
+                                // uploads with the same timeline as the GUI's.
+                                de::applyFileTimes(cp, t);
                             }
                         }
                     };
@@ -336,7 +348,11 @@ int main(int argc, char** argv) {
                 rs.write(reinterpret_cast<const char*>(rsrc.data()),
                          static_cast<std::streamsize>(rsrc.size()));
                 std::fprintf(stderr, "wrote %zu bytes to %s\n", rsrc.size(), rsrcPath.c_str());
+                rs.close();
+                de::applyFileTimes(rsrcPath, fs->fileTimes(f));
             }
+            out.close();
+            de::applyFileTimes(argv[5], fs->fileTimes(f));
         }
         return 0;
     }

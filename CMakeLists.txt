@@ -17,6 +17,7 @@ find_package(OpenSSL REQUIRED)
 # ---- Engine: pure C++, no Qt, unit-testable, reusable ----
 add_library(de_engine STATIC
   src/core/image_source.cpp
+  src/core/file_times.cpp
   src/partition/partition.cpp
   src/fs/fs_detect.cpp
   src/fs/ntfs/ntfs.cpp
