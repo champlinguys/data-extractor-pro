@@ -3,10 +3,21 @@ name: Release
 # Build prebuilt binaries and attach them to a GitHub Release whenever a
 # version tag (e.g. v0.1.0) is pushed. Users can then download and run the
 # AppImage without building anything.
+#
+# The manual trigger is the fallback for when a tag push does not create a run
+# (it silently failed to for v0.4.0, leaving the README pointing at download
+# URLs that 404). Pass an existing tag:
+#   gh workflow run release.yml --ref main -f tag=v0.4.0
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish (e.g. v0.4.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -15,7 +26,11 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
+      # On a manual run, build the tag that was asked for. On a tag push the
+      # input is empty and checkout falls back to the triggering ref.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Install build + packaging dependencies
         run: |
@@ -60,6 +75,9 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          # github.ref_name is the tag on a push, but the branch on a manual
+          # run - so the release would be cut against 'main' without this.
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
             DataExtractorPro-x86_64.AppImage
             de-cli-linux-x86_64.tar.gz
