@@ -29,25 +29,70 @@ uint32_t decodeSizeField(int8_t v, uint32_t unitBytes) {
     return 1u << static_cast<unsigned>(-v);
 }
 
-// Apply the NTFS "fixup"/update-sequence array in place. Each 512-byte sector
-// of a multi-sector structure (FILE / INDX record) has had its last two bytes
-// swapped out for a sequence number; restore the originals. Returns false if
-// the record is inconsistent (a torn write or a bad record).
+// Apply the NTFS "fixup"/update-sequence array in place. A multi-sector
+// structure (FILE / INDX record) is divided into equal chunks whose last two
+// bytes have been swapped out for a sequence number; restore the originals.
+// Returns false if the record is inconsistent (a torn write or a bad record).
+//
+// The chunk stride is derived from the record, NOT from the volume's bytes per
+// sector. usaCnt is 1 + one entry per protected chunk, so the stride is
+// simply rec.size() / (usaCnt - 1). This is the only reliable source.
+//
+// Why it matters: on a 4Kn volume the BPB reports 4096 bytes per sector, but
+// the MFT records are still protected in 512-byte chunks - a 4096-byte FILE
+// record carries usaCnt = 9, i.e. eight 512-byte chunks. Passing 4096 as the
+// stride made the second iteration address byte 8190 of a 4096-byte record,
+// hit the bounds check and return false, so EVERY MFT record failed to load
+// and the volume enumerated as completely empty. Seen on the 3 TB ST3000DM001
+// (case chris3tb): partitions and the FS type were detected fine, and the
+// filesystem still listed nothing at all.
+//
+// `sectorSize` is retained only as a fallback for the degenerate usaCnt == 1
+// case (a structure with no protected chunks).
 bool applyFixup(std::vector<uint8_t>& rec, uint32_t sectorSize) {
     if (rec.size() < 8) return false;
     uint16_t usaOff = rd16(&rec[4]);
     uint16_t usaCnt = rd16(&rec[6]);
     if (usaCnt == 0) return false;
     if (usaOff + static_cast<size_t>(usaCnt) * 2 > rec.size()) return false;
+    if (usaCnt == 1) return true;   // nothing protected; nothing to restore
+
+    const size_t stride = rec.size() / (usaCnt - 1);
+    // A stride must be a sane power-of-two sector multiple and leave room for
+    // the two bytes it protects; anything else means a malformed header.
+    if (stride < 2 || stride > rec.size() || (stride & (stride - 1)) != 0)
+        return false;
+    (void)sectorSize;
+
     uint16_t usn = rd16(&rec[usaOff]);
     for (uint16_t i = 1; i < usaCnt; ++i) {
-        size_t sectorEnd = static_cast<size_t>(i) * sectorSize - 2;
-        if (sectorEnd + 2 > rec.size()) return false;
-        // The last two bytes of the sector must currently hold the USN.
-        if (rd16(&rec[sectorEnd]) != usn) return false;
-        std::memcpy(&rec[sectorEnd], &rec[usaOff + i * 2], 2);
+        size_t chunkEnd = static_cast<size_t>(i) * stride - 2;
+        if (chunkEnd + 2 > rec.size()) return false;
+        // The last two bytes of the chunk must currently hold the USN.
+        if (rd16(&rec[chunkEnd]) != usn) return false;
+        std::memcpy(&rec[chunkEnd], &rec[usaOff + i * 2], 2);
     }
     return true;
+}
+
+// NTFS stores time as 100-nanosecond ticks since 1601-01-01 UTC; convert to
+// nanoseconds since the Unix epoch. 0 (and the 1601 epoch itself) means "not
+// set", which we pass through as 0 so the exporter leaves the attribute alone.
+constexpr int64_t FILETIME_UNIX_DELTA = 116444736000000000ll; // ticks, 1601->1970
+int64_t filetimeToUnixNs(uint64_t ft) {
+    if (ft == 0) return 0;
+    return (static_cast<int64_t>(ft) - FILETIME_UNIX_DELTA) * 100;
+}
+
+// Timestamp block shared by $STANDARD_INFORMATION and the $FILE_NAME key: four
+// FILETIMEs at +0x00 creation, +0x08 data modification, +0x10 MFT-record
+// modification, +0x18 last access.
+FsTimes readTimeBlock(const uint8_t* p) {
+    FsTimes t;
+    t.crtime = filetimeToUnixNs(rd64(p + 0x00));
+    t.mtime  = filetimeToUnixNs(rd64(p + 0x08));
+    t.atime  = filetimeToUnixNs(rd64(p + 0x18));
+    return t;
 }
 
 // Minimal UTF-16LE -> UTF-8 for filenames (handles the BMP plus surrogate
@@ -261,6 +306,24 @@ NtfsFilesystem::collectAttributes(const std::vector<uint8_t>& baseRec, uint64_t 
     return attrs;
 }
 
+FsTimes NtfsFilesystem::fileTimes(const FsNode& node) {
+    auto rec = readMftRecord(node.id);
+    if (rec.empty()) return node.times;      // fall back to the index copy
+    FsTimes t;
+    bool got = false;
+    forEachAttribute(rec, [&](const uint8_t* a, uint32_t len) {
+        if (rd32(a) != ATTR_STANDARD_INFO) return false;
+        if (a[8] != 0) return false;         // $STANDARD_INFORMATION is resident
+        uint32_t vlen = rd32(a + 16);
+        uint16_t voff = rd16(a + 20);
+        if (voff + 0x20u > len || vlen < 0x20) return false;
+        t = readTimeBlock(a + voff);
+        got = true;
+        return true;
+    });
+    return got ? t : node.times;
+}
+
 std::vector<FsNode> NtfsFilesystem::listDir(const FsNode& dir) {
     std::vector<FsNode> out;
     auto rec = readMftRecord(dir.id);
@@ -294,7 +357,11 @@ std::vector<FsNode> NtfsFilesystem::listDir(const FsNode& dir) {
                     uint32_t fnFlags = rd32(key + 0x38);
                     child.isDir = (fnFlags & 0x10000000u) != 0; // FILE_ATTR_DIRECTORY
                     child.size = rd64(key + 0x30);              // real size
-                    child.mtime = static_cast<int64_t>(rd64(key + 0x18));
+                    // $FILE_NAME times follow the 8-byte parent reference.
+                    // Cheap (they are already in the index block) but they can
+                    // be stale, so the export path re-reads
+                    // $STANDARD_INFORMATION via fileTimes().
+                    child.times = readTimeBlock(key + 0x08);
                     if (!child.name.empty() && child.name != ".")
                         out.push_back(std::move(child));
                 }

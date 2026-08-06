@@ -66,6 +66,7 @@ void loadPrefs() {
     p.collision     = collFromStr(s.value("export/collision", "rename").toString());
     p.exportBufferMiB = s.value("export/bufferMiB", 4).toInt();
     p.defaultExportDir = s.value("export/defaultDir", "").toString();
+    p.preserveTimestamps = s.value("export/preserveTimestamps", true).toBool();
     p.previewKiB    = s.value("reading/previewKiB", 64).toInt();
     p.rememberOptanePaths = s.value("optane/rememberPaths", true).toBool();
     p.lastQlcPath    = s.value("optane/lastQlc", "").toString();
@@ -83,6 +84,7 @@ void savePrefs() {
     s.setValue("export/collision", collStr(p.collision));
     s.setValue("export/bufferMiB", p.exportBufferMiB);
     s.setValue("export/defaultDir", p.defaultExportDir);
+    s.setValue("export/preserveTimestamps", p.preserveTimestamps);
     s.setValue("reading/previewKiB", p.previewKiB);
     s.setValue("optane/rememberPaths", p.rememberOptanePaths);
     s.setValue("optane/lastQlc", p.lastQlcPath);

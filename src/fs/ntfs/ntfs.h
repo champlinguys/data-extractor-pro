@@ -22,6 +22,7 @@ public:
     std::vector<FsNode> listDir(const FsNode& dir) override;
     std::vector<uint8_t> readFile(const FsNode& file) override;
     bool readFileStream(const FsNode& file, const DataSink& sink) override;
+    FsTimes fileTimes(const FsNode& node) override;
 
     // Quick, cheap check used by the detector.
     static bool probe(ImageSource& vol);

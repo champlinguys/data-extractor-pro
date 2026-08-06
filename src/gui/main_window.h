@@ -93,6 +93,7 @@ private:
     // the worker never touches QSettings/prefs.
     int exportHashKind_ = 0;   // 0 none, 1 md5, 2 sha256
     int exportCollision_ = 0;  // 0 rename, 1 overwrite, 2 skip
+    bool exportKeepTimes_ = true; // stamp source mtime/atime onto exports
 
     // Async open (runOpen) results, filled by the worker thread.
     std::atomic<bool> openDone_{false};

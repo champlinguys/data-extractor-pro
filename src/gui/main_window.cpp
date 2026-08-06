@@ -2,6 +2,7 @@
 #include "gui/hex_view.h"
 #include "gui/settings.h"
 #include "gui/preferences_dialog.h"
+#include "core/file_times.h"
 #include "partition/partition.h"
 #include "optane/span_map.h"
 #include "bitlocker/volume.h"
@@ -681,6 +682,10 @@ void MainWindow::exportWalk(Filesystem* fs, const FsNode& node, const QString& d
             exportWalk(fs, c, outPath);
             if (exportCancel_.load()) return;
         }
+        // After the children, not before: writing them bumps the directory's
+        // own mtime, so stamping it first would be undone.
+        if (exportKeepTimes_)
+            de::applyFileTimes(outPath.toStdString(), fs->fileTimes(node));
     } else {
         {
             std::lock_guard<std::mutex> lk(exportNameMutex_);
@@ -719,9 +724,19 @@ void MainWindow::exportWalk(Filesystem* fs, const FsNode& node, const QString& d
         if (ok && !exportCancel_.load()) {
             ++exportFiles_;
             // Resource fork (classic HFS): write "<name>.rsrc" sidecar if present.
+            bool wroteRsrc = false;
             if (auto rsrc = fs->readResourceFork(node); !rsrc.empty()) {
                 std::ofstream rs((outPath + ".rsrc").toStdString(), std::ios::binary | std::ios::trunc);
                 rs.write(reinterpret_cast<const char*>(rsrc.data()), static_cast<std::streamsize>(rsrc.size()));
+                wroteRsrc = true;
+            }
+            // Restore the source dates once the data is on disk. The resource
+            // fork is part of the same original file, so it gets them too; the
+            // hash sidecar keeps the real time we computed it.
+            if (exportKeepTimes_) {
+                FsTimes t = fs->fileTimes(node);
+                de::applyFileTimes(outPath.toStdString(), t);
+                if (wroteRsrc) de::applyFileTimes((outPath + ".rsrc").toStdString(), t);
             }
             if (md) {  // write "<hex>  <filename>" sidecar next to the file
                 unsigned char dig[EVP_MAX_MD_SIZE]; unsigned int dl = 0;
@@ -769,6 +784,7 @@ void MainWindow::exportSelected() {
         case de::gui::Collision::Skip:      exportCollision_ = 2; break;
         default:                            exportCollision_ = 0; break;
     }
+    exportKeepTimes_ = de::gui::prefs().preserveTimestamps;
 
     // Resolve the filesystem + node for each root on the UI thread (mounting
     // reads the image); the worker then owns all image access exclusively.

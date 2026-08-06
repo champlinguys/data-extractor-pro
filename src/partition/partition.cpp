@@ -1,6 +1,7 @@
 #include "partition/partition.h"
 #include "core/byte_reader.h"
 #include <array>
+#include <cstring>
 #include <optional>
 
 namespace de {
@@ -141,13 +142,69 @@ std::vector<Partition> scanGpt(const std::shared_ptr<ImageSource>& img,
     return best;
 }
 
+// Does a filesystem boot record live at this byte offset?
+// Checked by OEM/signature rather than by trusting the partition type byte,
+// because the type byte is what we are trying to corroborate.
+bool looksLikeVolumeStart(const std::shared_ptr<ImageSource>& img, uint64_t off) {
+    if (off + 512 > img->size()) return false;
+    auto b = img->read(off, 512);
+    if (std::memcmp(b.data() + 3, "NTFS    ", 8) == 0) return true;
+    if (std::memcmp(b.data() + 3, "-FVE-FS-", 8) == 0) return true;   // BitLocker
+    if (std::memcmp(b.data() + 3, "EXFAT   ", 8) == 0) return true;
+    if (std::memcmp(b.data() + 3, "MSDOS", 5) == 0) return true;
+    if (std::memcmp(b.data() + 0x52, "FAT32", 5) == 0) return true;
+    if (std::memcmp(b.data() + 0x36, "FAT", 3) == 0) return true;
+    return false;
+}
+
+// Work out the logical sector size the partition table was written in.
+//
+// 512 is not safe to assume. Native-4K (4Kn) drives store LBAs in the MBR in
+// 4096-byte units, so reading them as 512 lands every offset 8x too low: a
+// partition at LBA 2048 sits at byte 8,388,608, not 1,048,576. The scan then
+// looks 7 MB short of the boot sector, finds nothing, and reports "no
+// filesystem" on a perfectly good image.
+//
+// Seen for real on a 3 TB Seagate ST3000DM001 (4Kn, case chris3tb): at 512 its
+// sole NTFS partition computes as 349.3 GiB starting at 1 MiB; at 4096 it
+// computes as 3.00 TB starting at 8 MiB and matches the image exactly. Note
+// that lsblk makes the same mistake and also reports 349.3G, so agreeing with
+// the OS is not evidence of being right.
+//
+// Two independent signals, both required, so a coincidence in one cannot carry
+// the decision:
+//   1. a real filesystem boot record sits at startLBA * candidate
+//   2. the partition fits inside the image
+// Ties go to 512, which keeps existing 512e behaviour byte-for-byte.
+uint32_t detectSectorSize(const std::shared_ptr<ImageSource>& img,
+                          const std::vector<uint8_t>& mbr) {
+    static const uint32_t kCandidates[] = {512, 4096};
+    for (uint32_t cand : kCandidates) {
+        for (int i = 0; i < 4; ++i) {
+            const uint8_t* e = mbr.data() + 446 + i * 16;
+            uint8_t type = e[4];
+            uint32_t startLba = rd32(e + 8);
+            uint32_t sectors  = rd32(e + 12);
+            if (type == 0 || type == 0xEE || sectors == 0 || startLba == 0) continue;
+
+            uint64_t first = static_cast<uint64_t>(startLba) * cand;
+            uint64_t len   = static_cast<uint64_t>(sectors) * cand;
+            if (first + len > img->size()) continue;           // signal 2
+            if (!looksLikeVolumeStart(img, first)) continue;   // signal 1
+            return cand;
+        }
+    }
+    return 512;   // nothing corroborated; keep the historical default
+}
+
 } // namespace
 
 std::vector<Partition> scanPartitions(const std::shared_ptr<ImageSource>& img) {
     std::vector<Partition> out;
-    const uint32_t sectorSize = 512; // 512e is near-universal for imaged media
 
     auto mbr = img->read(0, 512);
+    // Derived from the table itself, never assumed. See detectSectorSize().
+    const uint32_t sectorSize = detectSectorSize(img, mbr);
     bool hasSig = (mbr[510] == 0x55 && mbr[511] == 0xAA);
 
     // A bare filesystem volume (image of a single partition, no partition
