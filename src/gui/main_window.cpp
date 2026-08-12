@@ -2,6 +2,7 @@
 #include "gui/hex_view.h"
 #include "gui/settings.h"
 #include "gui/preferences_dialog.h"
+#include "gui/device_picker.h"
 #include "core/file_times.h"
 #include "partition/partition.h"
 #include "raid/raid.h"
@@ -373,11 +374,16 @@ void MainWindow::openRaidSet() {
     layout->addLayout(buttonRow);
 
     connect(addDevice, &QPushButton::clicked, [&] {
-        // Raw drives live in /dev; reading them needs root, which we tell the
-        // user about only if the open actually fails.
-        QString p = QFileDialog::getOpenFileName(&dlg, "Add drive", "/dev",
-                                                 "All files (*)");
-        if (!p.isEmpty()) list->addItem(p);
+        // A file browser is no way to choose a physical disk: show the drives
+        // themselves, with the model, serial, size and what is actually on
+        // each one, so the right two can be told apart.
+        for (const QString& p : de::gui::pickBlockDevices(
+                 &dlg, "Select drives in the set", true)) {
+            bool already = false;
+            for (int i = 0; i < list->count(); ++i)
+                if (list->item(i)->text() == p) already = true;
+            if (!already) list->addItem(p);
+        }
     });
     connect(addImage, &QPushButton::clicked, [&] {
         QStringList ps = QFileDialog::getOpenFileNames(

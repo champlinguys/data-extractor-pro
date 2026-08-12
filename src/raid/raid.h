@@ -41,9 +41,16 @@ struct Layout {
     uint64_t stripeBytes = 64 * 1024; // Stripe only
     std::vector<Member> members;      // in RAID order
     std::string origin;               // where the geometry came from
+    // The true size of the logical disk, when something authoritative says so
+    // (a member descriptor, or the user). RAID implementations keep a reserve
+    // at the end of each member, so the logical disk is smaller than the
+    // members add up to. 0 = use everything the members offer.
+    uint64_t sizeLimitBytes = 0;
 
-    // Size of the assembled logical disk.
+    // Size of the assembled logical disk, after any size limit is applied.
     uint64_t logicalSize() const;
+    // What the members alone would give, ignoring sizeLimitBytes.
+    uint64_t rawLogicalSize() const;
     // One-line summary for the UI/CLI, e.g. "RAID 0, 2 members, 128 KiB stripe".
     std::string describe() const;
 };

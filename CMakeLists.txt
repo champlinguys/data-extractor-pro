@@ -48,6 +48,7 @@ add_executable(data-extractor
   src/gui/hex_view.cpp
   src/gui/settings.cpp
   src/gui/preferences_dialog.cpp
+  src/gui/device_picker.cpp
 )
 target_link_libraries(data-extractor PRIVATE de_engine Qt5::Widgets)
 

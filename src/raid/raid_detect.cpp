@@ -85,6 +85,13 @@ std::optional<Level> levelFromName(const std::string& name) {
     return std::nullopt;
 }
 
+// NUL-padded fixed-width ASCII out of a metadata block.
+std::string fixedString(const uint8_t* p, size_t max) {
+    size_t n = 0;
+    while (n < max && p[n] >= 0x20 && p[n] < 0x7F) ++n;
+    return std::string(reinterpret_cast<const char*>(p), n);
+}
+
 uint32_t crc32of(const uint8_t* p, size_t n) {
     return static_cast<uint32_t>(crc32(0, p, static_cast<uInt>(n)));
 }
@@ -304,6 +311,40 @@ MemberMetadata readMemberMetadata(ImageSource& dev) {
         return md;
     }
 
+    // An unlabelled descriptor in the very last sector of each member, seen on
+    // hardware-striped enclosures (an OWC Gemini pair carried it). It is not a
+    // published format, so only the fields that are unambiguous across the
+    // members of a set are read, and even those are treated as a hint: the
+    // reconstruction check still has the final say.
+    //
+    //   0   'As!' 0x09 magic
+    //   13  member index within the set
+    //   32  total sectors in the assembled set (big-endian, 64-bit)
+    //   40  set name, NUL-padded ASCII
+    if (size >= 512) {
+        auto tail = dev.read(size - 512, 512);
+        if (tail.size() >= 512 && std::memcmp(tail.data(), "As!\x09", 4) == 0) {
+            md.format = "enclosure RAID descriptor";
+            md.memberIndex = tail[13];
+            uint64_t sectors = 0;
+            for (int i = 0; i < 8; ++i)
+                sectors = (sectors << 8) | tail[32 + i];
+            // Sanity: the set cannot be smaller than one member or absurdly
+            // larger than the members could add up to.
+            if (sectors > size / 512 && sectors < (size / 512) * 64)
+                md.setSectors = sectors;
+            md.setName = fixedString(tail.data() + 40, 24);
+            // The remaining bytes plausibly encode the stripe size and member
+            // count, but one set is not enough to be sure of them, so they are
+            // left to the geometry search - which verifies its answer anyway.
+            md.notes.push_back(
+                "carries an enclosure RAID descriptor in its last sector"
+                + (md.setName.empty() ? std::string()
+                                      : " for the set '" + md.setName + "'"));
+            return md;
+        }
+    }
+
     // SoftRAID (what OWC ships with its enclosures) keeps a proprietary
     // descriptor we do not decode. Note it and let reconstruction decide the
     // geometry - that check does not care who wrote the set.
@@ -362,18 +403,34 @@ int scoreAssembled(const std::shared_ptr<ImageSource>& disk, bool deep,
         }
     }
 
-    // --- backup GPT at the very end ---
-    // A GPT always has a second copy in the last sector of the disk. It only
-    // lands there if the total size and the member ordering are both right, so
-    // its absence is evidence *against* a geometry, not merely a missed bonus.
+    // --- backup GPT ---
+    // A GPT always has a second copy near the end of the disk, and the primary
+    // header names the sector it lives in. Checking *that* sector rather than
+    // simply the last one matters: a RAID set reserves space at the end of
+    // each member for its own metadata, so the logical disk stops short of
+    // where the members add up to, and looking only at the final sector would
+    // condemn a perfectly good geometry.
+    //
+    // Either way this is strong evidence, because the backup only lands in the
+    // right place if the total size and member ordering are both right.
     if (haveGpt && disk->size() >= 1024) {
-        auto tail = disk->read(disk->size() - 512, 512);
-        if (std::memcmp(tail.data(), "EFI PART", 8) == 0 && gptHeaderCrcOk(tail)) {
+        uint64_t altLba = rd64(lba1.data() + 32);
+        bool found = false;
+        if (altLba && (altLba + 1) * 512 <= disk->size()) {
+            auto at = disk->read(altLba * 512, 512);
+            found = std::memcmp(at.data(), "EFI PART", 8) == 0 && gptHeaderCrcOk(at);
+            if (found) ev += "backup GPT verified where the header says it is; ";
+        }
+        if (!found) {
+            auto tail = disk->read(disk->size() - 512, 512);
+            found = std::memcmp(tail.data(), "EFI PART", 8) == 0 && gptHeaderCrcOk(tail);
+            if (found) ev += "backup GPT at the end verified; ";
+        }
+        if (found) {
             score += 8;
-            ev += "backup GPT at the end verified; ";
         } else {
             score -= CONTRADICTION;
-            ev += "NO valid backup GPT at the end (assembled size is wrong); ";
+            ev += "NO valid backup GPT (assembled size is wrong); ";
         }
     }
 
@@ -553,10 +610,11 @@ namespace {
 // Build a layout from an ordering, level, stripe size and per-member offset.
 Layout makeLayout(const std::vector<std::shared_ptr<ImageSource>>& devs,
                   const std::vector<size_t>& order, Level level, uint64_t stripe,
-                  uint64_t dataOffset) {
+                  uint64_t dataOffset, uint64_t sizeLimitBytes = 0) {
     Layout l;
     l.level = level;
     l.stripeBytes = stripe;
+    l.sizeLimitBytes = sizeLimitBytes;
     for (size_t idx : order) {
         Member m;
         m.src = devs[idx];
@@ -639,14 +697,29 @@ DetectResult detect(const std::vector<std::shared_ptr<ImageSource>>& devices,
     }
 
     // Candidate geometries.
+    // If a member's own descriptor states the size of the assembled set, honour
+    // it: the difference is the space the RAID reserves for its metadata, and
+    // getting it right puts the backup GPT exactly where it belongs.
+    uint64_t sizeLimit = 0;
+    for (const auto& md : r.metadata)
+        if (md.setSectors) sizeLimit = md.setSectors * 512;
+    if (sizeLimit) {
+        uint64_t members = 0;
+        for (const auto& d : devices) members += d->size();
+        if (members > sizeLimit)
+            r.notes.push_back("the set reserves " +
+                              std::to_string((members - sizeLimit) / (1024 * 1024)) +
+                              " MiB at the end of the drives for its own metadata");
+    }
+
     std::vector<Candidate> cands;
     for (const auto& order : orders) {
         for (uint64_t off : offsets) {
-            cands.push_back({makeLayout(devices, order, Level::Concat, 0, off), 0, ""});
+            cands.push_back({makeLayout(devices, order, Level::Concat, 0, off, sizeLimit), 0, "", false});
             for (uint64_t s : opt.stripeSizes)
-                cands.push_back({makeLayout(devices, order, Level::Stripe, s, off), 0, ""});
+                cands.push_back({makeLayout(devices, order, Level::Stripe, s, off, sizeLimit), 0, "", false});
             if (devices.size() > 1)
-                cands.push_back({makeLayout(devices, order, Level::Mirror, 0, off), 0, ""});
+                cands.push_back({makeLayout(devices, order, Level::Mirror, 0, off, sizeLimit), 0, "", false});
             if (order.size() > 1) break; // one ordering's worth of offsets is enough
         }
     }

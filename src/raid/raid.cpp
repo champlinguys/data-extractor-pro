@@ -29,6 +29,11 @@ std::string humanSize(uint64_t bytes) {
 } // namespace
 
 uint64_t Layout::logicalSize() const {
+    uint64_t size = rawLogicalSize();
+    return sizeLimitBytes && sizeLimitBytes < size ? sizeLimitBytes : size;
+}
+
+uint64_t Layout::rawLogicalSize() const {
     if (members.empty()) return 0;
     switch (level) {
         case Level::Concat: {

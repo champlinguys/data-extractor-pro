@@ -107,7 +107,10 @@ de-cli 'raid:concat:/dev/sdc,/dev/sdd'        # spanned / JBOD
 de-cli 'raid:mirror:/dev/sdc,/dev/sdd'        # RAID 1
 ```
 
-Either way the result is checked before you rely on it. In the GUI it is
+Where a set writes a descriptor of its own (the OWC Gemini keeps one in the
+last sector of each drive), the member order, set name and set size are read
+straight out of it; the rest is worked out and, either way, the result is
+checked before you rely on it. In the GUI it is
 **File -> Open RAID Set** (Ctrl+R), or pass the same spec on the command line:
 `data-extractor 'raid:auto:/dev/sdc,/dev/sdd'`. Reading raw drives needs root.
 
@@ -281,10 +284,11 @@ turn it off under *Preferences -> Export -> Timestamps*.
   Encrypted volumes are already identified and reported.
 - **RAID 5/6** - parity sets. Only striping, concatenation and mirroring are
   handled today.
-- **SoftRAID metadata** - its on-disk format is not published, so a SoftRAID
-  set is currently reassembled by the geometry search rather than by reading
-  its descriptor. The search verifies its answer, so this is a speed issue
-  rather than a correctness one.
+- **RAID descriptors** - the enclosure descriptor in the last sector of each
+  member is read for the member order, set name and set size; the stripe size
+  and level within it are not decoded yet, so those still come from the
+  geometry search. SoftRAID's own format is not published either. The search
+  verifies its answer, so these are speed issues rather than correctness ones.
 - **Deleted-file recovery** - scavenge unallocated MFT records / inodes;
   `FsNode::isDeleted` is already plumbed through the model.
 - NTFS gaps: LZNT1-**compressed** streams and named/alternate data streams.

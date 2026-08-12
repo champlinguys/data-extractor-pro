@@ -38,6 +38,11 @@ struct MemberMetadata {
     int memberCount = -1;
     uint64_t sequence = 0;   // higher = more recently updated
     uint64_t dataOffset = 0; // where member data starts, if stated
+    // Total size of the assembled set, when the metadata states it. Worth a
+    // lot: RAID implementations reserve space at the end of each member for
+    // their own use, so the logical disk is smaller than the members add up
+    // to, and the backup GPT sits at the end of the *logical* disk.
+    uint64_t setSectors = 0;
     std::vector<std::string> notes;
 };
 
