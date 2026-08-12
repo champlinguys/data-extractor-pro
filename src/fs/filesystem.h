@@ -66,6 +66,22 @@ public:
         return sink(data.data(), data.size());
     }
 
+    // Read up to `maxBytes` from the start of a file. Streams and stops as soon
+    // as it has enough, so it stays cheap on multi-gigabyte files. Used for
+    // previews and, importantly, by the RAID prober: checking that files
+    // actually begin with the signature their name implies is what proves a
+    // reassembled disk is really the original one.
+    std::vector<uint8_t> readHead(const FsNode& file, size_t maxBytes) {
+        std::vector<uint8_t> out;
+        out.reserve(maxBytes);
+        readFileStream(file, [&](const uint8_t* d, size_t n) {
+            size_t take = std::min(n, maxBytes - out.size());
+            out.insert(out.end(), d, d + take);
+            return out.size() < maxBytes; // false stops the stream
+        });
+        return out;
+    }
+
     // Resource fork of a file, or empty if none/not applicable. Default is
     // empty so existing filesystems (NTFS) need no changes; HFS overrides it.
     virtual std::vector<uint8_t> readResourceFork(const FsNode& /*file*/) { return {}; }

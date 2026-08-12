@@ -13,6 +13,7 @@ endif()
 
 find_package(Qt5 COMPONENTS Widgets REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
 
 # ---- Engine: pure C++, no Qt, unit-testable, reusable ----
 add_library(de_engine STATIC
@@ -22,6 +23,13 @@ add_library(de_engine STATIC
   src/fs/fs_detect.cpp
   src/fs/ntfs/ntfs.cpp
   src/fs/hfs/hfs.cpp
+  src/fs/apfs/apfs_container.cpp
+  src/fs/apfs/apfs.cpp
+  src/fs/compression/decmpfs.cpp
+  src/fs/compression/lzvn.cpp
+  src/fs/hfsplus/hfsplus.cpp
+  src/raid/raid.cpp
+  src/raid/raid_detect.cpp
   src/optane/imsm.cpp
   src/optane/optane_merge.cpp
   src/optane/span_map.cpp
@@ -31,7 +39,7 @@ add_library(de_engine STATIC
 )
 target_include_directories(de_engine PUBLIC src)
 target_compile_options(de_engine PRIVATE -Wall -Wextra)
-target_link_libraries(de_engine PUBLIC OpenSSL::Crypto)
+target_link_libraries(de_engine PUBLIC OpenSSL::Crypto ZLIB::ZLIB)
 
 # ---- GUI: Qt Widgets front-end ----
 add_executable(data-extractor

@@ -4,6 +4,8 @@
 #include "gui/preferences_dialog.h"
 #include "core/file_times.h"
 #include "partition/partition.h"
+#include "raid/raid.h"
+#include "raid/raid_detect.h"
 #include "optane/span_map.h"
 #include "bitlocker/volume.h"
 #include "bitlocker/fve.h"
@@ -29,7 +31,11 @@
 #include <QDialogButtonBox>
 #include <QProgressDialog>
 #include <QMenu>
+#include <QListWidget>
+#include <QComboBox>
+#include <QVBoxLayout>
 #include <QTimer>
+#include <QRegularExpression>
 #include <functional>
 #include <algorithm>
 #include <vector>
@@ -71,6 +77,10 @@ MainWindow::MainWindow() {
     openOptaneAct->setShortcut(QKeySequence("Ctrl+Shift+O"));
     connect(openOptaneAct, &QAction::triggered, this, &MainWindow::openOptaneSet);
 
+    auto* openRaidAct = new QAction("Open &RAID Set...", this);
+    openRaidAct->setShortcut(QKeySequence("Ctrl+R"));
+    connect(openRaidAct, &QAction::triggered, this, &MainWindow::openRaidSet);
+
     auto* exportAct = new QAction("&Export Selected...", this);
     exportAct->setShortcut(QKeySequence("Ctrl+E"));
     connect(exportAct, &QAction::triggered, this, &MainWindow::exportSelected);
@@ -82,6 +92,7 @@ MainWindow::MainWindow() {
     auto* fileMenu = menuBar()->addMenu("&File");
     fileMenu->addAction(openAct);
     fileMenu->addAction(openOptaneAct);
+    fileMenu->addAction(openRaidAct);
     fileMenu->addAction(exportAct);
     fileMenu->addSeparator();
     auto* quitAct = fileMenu->addAction("&Quit");
@@ -245,6 +256,202 @@ void MainWindow::loadOptaneSet(const QString& qlcPath, const QString& optanePath
     });
 }
 
+void MainWindow::openSourceSpec(const QString& spec) {
+    if (!spec.startsWith("raid:")) { loadImage(spec); return; }
+
+    // raid:auto:dev1,dev2  |  raid:stripe:128k:dev1,dev2  |  raid:concat:...
+    QStringList parts = spec.mid(5).split(':');
+    if (parts.size() < 2) {
+        QMessageBox::critical(this, "Open failed",
+                              "Expected raid:auto:<drive>,<drive> or "
+                              "raid:stripe:<size>:<drive>,<drive>");
+        return;
+    }
+    const QString mode = parts.takeFirst();
+    uint64_t stripeBytes = 128 * 1024;
+    if (mode == "stripe" && parts.size() >= 2) {
+        QString s = parts.takeFirst().toLower();
+        uint64_t mult = s.endsWith('k') ? 1024 : s.endsWith('m') ? 1024 * 1024 : 1;
+        stripeBytes = s.remove(QRegularExpression("[km]$")).toULongLong() * mult;
+    }
+
+    std::vector<std::shared_ptr<ImageSource>> devs;
+    for (const QString& path : parts.join(':').split(',', Qt::SkipEmptyParts)) {
+        try {
+            devs.push_back(std::make_shared<RawImageSource>(path.toStdString()));
+        } catch (const std::exception& e) {
+            QMessageBox::critical(this, "Open failed", e.what());
+            return;
+        }
+    }
+    if (devs.empty()) return;
+
+    const int modeIndex = mode == "auto"     ? 0
+                          : mode == "stripe" ? 1
+                          : mode == "concat" ? 2
+                                             : 3;
+    openRaidDevices(devs, modeIndex, stripeBytes);
+}
+
+// Shared by the dialog and the command line: assemble the set (detecting the
+// geometry if asked), check it, and populate the tree.
+void MainWindow::openRaidDevices(std::vector<std::shared_ptr<ImageSource>> devs,
+                                 int modeIndex, uint64_t stripeBytes) {
+    runOpen("RAID set", [this, devs, modeIndex, stripeBytes] {
+        std::shared_ptr<ImageSource> disk;
+        if (modeIndex == 0) {
+            auto r = de::raid::detect(devs);
+            for (const auto& n : r.notes) openInfo_ += n + "\n";
+            if (!r.assembled) {
+                openError_ = "These drives could not be reassembled: " + r.summary +
+                             "\n\nIf you know how the set was configured, choose "
+                             "the geometry by hand instead.";
+                return;
+            }
+            openInfo_ = "Reassembled as:\n  " + r.layout.describe() + "\n\n" +
+                        "Confirmed by: " + r.summary + "\n" + openInfo_;
+            disk = de::raid::assemble(r.layout);
+        } else {
+            de::raid::Layout layout;
+            layout.level = modeIndex == 1   ? de::raid::Level::Stripe
+                           : modeIndex == 2 ? de::raid::Level::Concat
+                                            : de::raid::Level::Mirror;
+            layout.stripeBytes = stripeBytes;
+            layout.origin = "chosen by hand";
+            for (const auto& d : devs) {
+                de::raid::Member m;
+                m.src = d;
+                m.label = d->name();
+                layout.members.push_back(std::move(m));
+            }
+            disk = de::raid::assemble(layout);
+            if (!disk) {
+                openError_ = "That geometry is not usable.";
+                return;
+            }
+            // Check the chosen geometry rather than trusting it: a wrong stripe
+            // size produces a browsable-looking volume full of shredded files.
+            std::string ev;
+            bool fsVerified = false;
+            de::raid::scoreAssembled(disk, true, &ev, &fsVerified);
+            if (fsVerified)
+                openInfo_ = layout.describe() + "\n\nVerified: " + ev;
+            else
+                openWarning_ = "This geometry does not verify - the filesystems "
+                               "on it do not read back correctly (" + ev +
+                               ").\nAnything you export may be corrupt. Try "
+                               "auto-detect, or a different stripe size.";
+        }
+        openedSource_ = disk;
+        openedVols_ = prepareVolumes(disk, "");
+    });
+}
+
+void MainWindow::openRaidSet() {
+    QDialog dlg(this);
+    dlg.setWindowTitle("Open RAID Set");
+    dlg.setMinimumWidth(620);
+    auto* layout = new QVBoxLayout(&dlg);
+
+    layout->addWidget(new QLabel(
+        "Add every drive in the set. Order only matters if you choose a "
+        "geometry by hand -\nauto-detect works it out, then checks the result "
+        "by reading the filesystem on it.", &dlg));
+
+    auto* list = new QListWidget(&dlg);
+    list->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    layout->addWidget(list);
+
+    auto* buttonRow = new QHBoxLayout();
+    auto* addDevice = new QPushButton("Add Drive...", &dlg);
+    auto* addImage = new QPushButton("Add Image File...", &dlg);
+    auto* moveUp = new QPushButton("Move Up", &dlg);
+    auto* moveDown = new QPushButton("Move Down", &dlg);
+    auto* remove = new QPushButton("Remove", &dlg);
+    for (auto* b : {addDevice, addImage, moveUp, moveDown, remove})
+        buttonRow->addWidget(b);
+    layout->addLayout(buttonRow);
+
+    connect(addDevice, &QPushButton::clicked, [&] {
+        // Raw drives live in /dev; reading them needs root, which we tell the
+        // user about only if the open actually fails.
+        QString p = QFileDialog::getOpenFileName(&dlg, "Add drive", "/dev",
+                                                 "All files (*)");
+        if (!p.isEmpty()) list->addItem(p);
+    });
+    connect(addImage, &QPushButton::clicked, [&] {
+        QStringList ps = QFileDialog::getOpenFileNames(
+            &dlg, "Add image files", QString(),
+            "Disk images (*.img *.dd *.raw *.bin *.001);;All files (*)");
+        for (const auto& p : ps) list->addItem(p);
+    });
+    connect(remove, &QPushButton::clicked, [&] {
+        qDeleteAll(list->selectedItems());
+    });
+    auto move = [list](int delta) {
+        int row = list->currentRow();
+        int to = row + delta;
+        if (row < 0 || to < 0 || to >= list->count()) return;
+        auto* item = list->takeItem(row);
+        list->insertItem(to, item);
+        list->setCurrentRow(to);
+    };
+    connect(moveUp, &QPushButton::clicked, [&] { move(-1); });
+    connect(moveDown, &QPushButton::clicked, [&] { move(1); });
+
+    auto* form = new QFormLayout();
+    auto* mode = new QComboBox(&dlg);
+    mode->addItem("Work it out automatically (recommended)");
+    mode->addItem("RAID 0 - striped");
+    mode->addItem("Concatenated - JBOD / spanned");
+    mode->addItem("RAID 1 - mirrored");
+    form->addRow("Geometry:", mode);
+
+    auto* stripe = new QComboBox(&dlg);
+    for (const char* s : {"4 KiB", "8 KiB", "16 KiB", "32 KiB", "64 KiB",
+                          "128 KiB", "256 KiB", "512 KiB", "1 MiB", "2 MiB"})
+        stripe->addItem(s);
+    stripe->setCurrentIndex(5);
+    stripe->setEnabled(false);
+    form->addRow("Stripe size:", stripe);
+    connect(mode, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            [stripe](int i) { stripe->setEnabled(i == 1); });
+    layout->addLayout(form);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
+                                         &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    layout->addWidget(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    std::vector<std::shared_ptr<ImageSource>> devs;
+    QStringList labels;
+    for (int i = 0; i < list->count(); ++i) {
+        QString path = list->item(i)->text();
+        try {
+            devs.push_back(std::make_shared<RawImageSource>(path.toStdString()));
+            labels << path;
+        } catch (const std::exception& e) {
+            QMessageBox::critical(this, "Open failed",
+                                  QString("%1\n\nReading a drive directly usually "
+                                          "needs root - try starting the program "
+                                          "with sudo.").arg(e.what()));
+            return;
+        }
+    }
+    if (devs.size() < 2) {
+        QMessageBox::warning(this, "Open RAID Set",
+                             "Add at least two drives.");
+        return;
+    }
+
+    const int modeIndex = mode->currentIndex();
+    const uint64_t stripeBytes = 4096ull << stripe->currentIndex();
+    openRaidDevices(std::move(devs), modeIndex, stripeBytes);
+}
+
 void MainWindow::loadImage(const QString& path) {
     std::shared_ptr<ImageSource> src;
     try {
@@ -295,6 +502,7 @@ void MainWindow::runOpen(const QString& label, std::function<void()> producer) {
     openDone_ = false;
     openError_.clear();
     openWarning_.clear();
+    openInfo_.clear();
     openedSource_.reset();
     openedVols_.clear();
 
@@ -325,6 +533,8 @@ void MainWindow::runOpen(const QString& label, std::function<void()> producer) {
     }
     if (!openWarning_.empty())
         QMessageBox::warning(this, "Open", QString::fromStdString(openWarning_));
+    if (!openInfo_.empty())
+        QMessageBox::information(this, "Open", QString::fromStdString(openInfo_));
     buildTree(openedVols_, label, openedSource_ ? openedSource_->size() : 0);
 }
 

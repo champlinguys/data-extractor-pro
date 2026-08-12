@@ -53,7 +53,91 @@ Status:
   a reference Python implementation on two real 1.44 MB customer floppies,
   including heavily fragmented forks.
 
-HFS+ and ext4 are on the roadmap below.
+- **HFS+ / HFSX** - working: Mac OS Extended, the filesystem on most Mac
+  external drives formatted before APFS. Volume header, catalog and
+  extents-overflow B-trees walked lazily (nothing is loaded up front, so a
+  multi-terabyte volume opens instantly), fragmented files via the
+  extents-overflow tree, hard links, resource forks, and transparently
+  compressed files. Verified byte-for-byte against filesystems created and
+  populated by Linux's own `mkfs.hfsplus`/`hfsplus` driver, including a
+  60-extent fragmented file and a 4000-entry directory (`tools/verify_hfsplus.sh`).
+
+- **RAID / multi-drive sets** - working: present two or more drives as one
+  disk - RAID 0 (striped), concatenated/JBOD, or RAID 1 (mirrored, with reads
+  falling back to the other member when one drive has bad sectors). If you do
+  not know how the set was configured, it works the geometry out and *verifies*
+  it (see below). Verified end-to-end on striped sets at four stripe sizes and
+  on a concatenated set, in each case recovering the geometry with no hints and
+  reading every file back byte-for-byte (`tools/verify_raid.sh`).
+
+- **APFS** - working: containers and their volumes, the object map and
+  filesystem B-trees, sparse and multi-extent files, extended attributes, and
+  Fusion (two-device) containers. FileVault-encrypted volumes are identified
+  and reported, not decrypted. Verified against synthetic containers built by
+  `tools/mkapfs.py`, including a multi-level B-tree.
+
+- **Apple transparent compression (decmpfs)** - working for both HFS+ and
+  APFS: zlib and LZVN, stored in either the attribute or the resource fork.
+  Without this a large share of the files on a Mac volume export as zero bytes.
+  The LZVN decoder is checked against Apple's own reference encoder from the
+  LZFSE project. LZFSE-compressed files are reported as unsupported rather than
+  exported as corrupt.
+
+ext4 is on the roadmap below.
+
+## Recovering a two-drive RAID set (e.g. an OWC Gemini)
+
+Add both drives; the geometry is worked out and checked for you:
+
+```sh
+# analyse a set: shows every geometry tried, best first, with the evidence
+de-cli raid /dev/sdc /dev/sdd
+
+# then use it - any command takes a RAID set in place of an image
+de-cli 'raid:auto:/dev/sdc,/dev/sdd'                    # list partitions
+de-cli 'raid:auto:/dev/sdc,/dev/sdd' ls 2               # browse the volume
+de-cli 'raid:auto:/dev/sdc,/dev/sdd' export 2 28 /mnt/dest/StormySky
+```
+
+If you already know the geometry, state it and skip the search:
+
+```sh
+de-cli 'raid:stripe:128k:/dev/sdc,/dev/sdd'   # RAID 0, 128 KiB stripe
+de-cli 'raid:concat:/dev/sdc,/dev/sdd'        # spanned / JBOD
+de-cli 'raid:mirror:/dev/sdc,/dev/sdd'        # RAID 1
+```
+
+Either way the result is checked before you rely on it. In the GUI it is
+**File -> Open RAID Set** (Ctrl+R), or pass the same spec on the command line:
+`data-extractor 'raid:auto:/dev/sdc,/dev/sdd'`. Reading raw drives needs root.
+
+`export` writes a whole folder recursively and preserves dates, which is the
+workflow when the destination is smaller than the source: browse, pick the
+folders you need, take only those.
+
+### How the geometry is worked out
+
+Guessing wrong is worse than failing, because a wrong stripe size yields a
+volume that mounts, lists files, and hands back shredded data. So each
+candidate (member order x level x stripe size) is assembled and then judged on
+evidence, and contradictions count against it rather than merely failing to
+count for it:
+
+- The **backup GPT** in the last sector and the **backup HFS+ volume header**
+  at the end of the volume: these only appear if the total size and member
+  order are right.
+- Whether the volume's own recorded size **fits the space it sits in** - this
+  is what catches a stripe read as a mirror.
+- A **catalog walk** compared against the file and folder counts the volume
+  header records.
+- Decisively, **the files themselves**: a sample of files whose names promise a
+  known format (`.NEF`, `.JPG`, `.MOV`, ...) must actually start with that
+  format's signature. Metadata can survive a wrong geometry - half the address
+  space still maps correctly when the guessed stripe is a multiple of the real
+  one - but a hundred photo headers cannot.
+
+A geometry that no filesystem confirms is reported as *not* solved, with the
+best attempt shown, rather than being offered as an answer.
 
 ## Optane + BitLocker workflow (CLI)
 
@@ -81,6 +165,21 @@ cmake --build build -j
 
 Produces `build/data-extractor` (GUI) and `build/de-cli` (headless).
 
+## Tests
+
+The tricky parsers are checked against filesystems and streams produced by
+*other* implementations wherever one exists, rather than only against
+themselves:
+
+```sh
+tools/verify_hfsplus.sh    # HFS+: mkfs.hfsplus + the kernel driver create it,
+                           # we read it back (needs sudo for the loop mount)
+tools/verify_raid.sh       # RAID: split a real disk image into members at a
+                           # stripe size the detector is not told, then check
+                           # it recovers the geometry and every file
+python3 tools/verify_apfs.py   # APFS: synthetic containers from tools/mkapfs.py
+```
+
 ## Using the CLI
 
 ```sh
@@ -88,8 +187,11 @@ de-cli disk.img                     # list partitions + detected filesystems
 de-cli disk.img ls 1                # list the root of partition 1
 de-cli disk.img ls 1 65             # list a directory by its MFT record number
 de-cli disk.img cat 1 64            # dump a file's data to stdout
-de-cli disk.img extract 1 67 out.bin
+de-cli disk.img extract 1 67 out.bin # write one file
+de-cli disk.img export 1 65 outdir/  # recursively export a folder, with dates
 ```
+
+Any of these takes a RAID set in place of `disk.img` - see above.
 
 ## Architecture
 
@@ -101,19 +203,20 @@ filesystem parsers.
 +-----------------------------------------------------+
 | GUI (Qt5)              CLI (de-cli)                  |  front-ends
 +-----------------------------------------------------+
-| Filesystem: NTFS  HFS  [HFS+]  [ext4]               |  fs/ - browse + read
+| Filesystem: NTFS HFS HFS+ APFS [ext4]               |  fs/ - browse + read
 +-----------------------------------------------------+
 | Partition scan: MBR / GPT                           |  partition/
 +-----------------------------------------------------+
-| ImageSource: Raw | SubImage | OptaneMerge | BitLocker|  core/ - the key seam
+| ImageSource: Raw | SubImage | OptaneMerge |         |  core/ - the key seam
+|              BitLocker | RAID (stripe/concat/mirror) |
 +-----------------------------------------------------+
 ```
 
 The pivot is **`ImageSource`** (`src/core/image_source.h`): a raw image, a
 single-partition window, the merged Optane volume, and a decrypt-on-read
 BitLocker volume are all just byte sources. The filesystem parsers only ever see
-"a volume of bytes," so Optane reconstruction and BitLocker decryption are each
-*a new `ImageSource`, not a change to NTFS/HFS+/ext4*.
+"a volume of bytes," so Optane reconstruction, BitLocker decryption and RAID
+reassembly are each *a new `ImageSource`, not a change to NTFS/HFS+/APFS/ext4*.
 
 ### What NTFS support does today (`src/fs/ntfs/`)
 - Boot-sector geometry (sector/cluster size, MFT location, record size)
@@ -172,7 +275,16 @@ turn it off under *Preferences -> Export -> Timestamps*.
 
 - **ext4** - superblock, inode + extent tree (and legacy block maps), HTree
   directories. Signature detection already stubbed in `fs_detect.cpp`.
-- **HFS+/HFSX** - volume header, catalog + extents B-trees. Also stubbed.
+- **LZFSE decmpfs** - compression types 11/12. Currently reported as
+  unsupported rather than exported as corrupt.
+- **FileVault (encrypted APFS)** - the keybag, and AES-XTS volume decryption.
+  Encrypted volumes are already identified and reported.
+- **RAID 5/6** - parity sets. Only striping, concatenation and mirroring are
+  handled today.
+- **SoftRAID metadata** - its on-disk format is not published, so a SoftRAID
+  set is currently reassembled by the geometry search rather than by reading
+  its descriptor. The search verifies its answer, so this is a speed issue
+  rather than a correctness one.
 - **Deleted-file recovery** - scavenge unallocated MFT records / inodes;
   `FsNode::isDeleted` is already plumbed through the model.
 - NTFS gaps: LZNT1-**compressed** streams and named/alternate data streams.
@@ -200,9 +312,12 @@ item above.
 ```
 src/core/        ImageSource, byte-reader helpers
 src/partition/   MBR + GPT scanning
-src/fs/          Filesystem interface, detector, ntfs/
+src/fs/          Filesystem interface, detector, ntfs/ hfs/ hfsplus/ apfs/
+src/fs/compression/  Apple decmpfs (zlib, LZVN) shared by HFS+ and APFS
+src/raid/        multi-drive assembly + geometry detection
 src/gui/         Qt5 main window + hex view
 src/cli/         headless driver
+tools/           test-image builders and verification scripts
 ```
 
 ## License

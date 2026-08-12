@@ -1,6 +1,8 @@
 #include "fs/filesystem.h"
 #include "fs/ntfs/ntfs.h"
 #include "fs/hfs/hfs.h"
+#include "fs/apfs/apfs.h"
+#include "fs/hfsplus/hfsplus.h"
 #include <cstring>
 
 namespace de {
@@ -8,6 +10,8 @@ namespace de {
 std::string detectFilesystemName(ImageSource& vol) {
     if (NtfsFilesystem::probe(vol)) return "NTFS";
     if (HfsFilesystem::probe(vol)) return "HFS";
+    if (ApfsFilesystem::probe(vol)) return "APFS";
+    if (HfsPlusFilesystem::probe(vol)) return "HFS+";
 
     // BitLocker volume: FVE boot record signature at offset 3.
     uint8_t vbr[512];
@@ -23,18 +27,15 @@ std::string detectFilesystemName(ImageSource& vol) {
         uint16_t magic = static_cast<uint16_t>(buf[0x38] | (buf[0x39] << 8));
         if (magic == 0xEF53) return "ext2/3/4 (browsing not yet implemented)";
     }
-    uint8_t hdr[8];
-    if (vol.readAt(1024, hdr, 8) >= 2) {
-        if (std::memcmp(hdr, "H+", 2) == 0) return "HFS+ (browsing not yet implemented)";
-        if (std::memcmp(hdr, "HX", 2) == 0) return "HFSX (browsing not yet implemented)";
-    }
     return "Unknown";
 }
 
 std::unique_ptr<Filesystem> detectFilesystem(std::shared_ptr<ImageSource> vol) {
     if (auto ntfs = NtfsFilesystem::open(vol)) return ntfs;
     if (auto hfs = HfsFilesystem::open(vol)) return hfs;
-    // HFS+ and ext4 will slot in here as they come online.
+    if (auto hfsp = HfsPlusFilesystem::open(vol)) return hfsp;
+    if (auto apfs = ApfsFilesystem::open(vol)) return apfs;
+    // ext4 will slot in here as it comes online.
     return nullptr;
 }
 

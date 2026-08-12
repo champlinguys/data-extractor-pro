@@ -24,9 +24,15 @@ class MainWindow : public QMainWindow {
 public:
     MainWindow();
 
+    // Open a source given on the command line: an image path, or a RAID spec
+    // like "raid:auto:/dev/sdc,/dev/sdd" (the same syntax de-cli accepts).
+    void openSourceSpec(const QString& spec);
+
 private slots:
     void openImage();
     void openOptaneSet();
+    // Open two or more drives as one RAID set (the OWC/SoftRAID case).
+    void openRaidSet();
     void openPreferences();
     void applyPrefs();          // re-apply theme-driven bits (fonts, etc.)
     void onItemExpanded(QTreeWidgetItem* item);
@@ -42,6 +48,10 @@ private:
     // swap in the decrypted source and turn the row into a browsable one.
     void unlockBitLockerItem(QTreeWidgetItem* partitionItem);
     void loadImage(const QString& path);
+    // Assemble `devs` (modeIndex: 0 auto, 1 stripe, 2 concat, 3 mirror) and
+    // load the result into the tree.
+    void openRaidDevices(std::vector<std::shared_ptr<de::ImageSource>> devs,
+                         int modeIndex, uint64_t stripeBytes);
     // Reconstruct a QLC+Optane pair and (optionally) unlock BitLocker, then
     // browse the result. `cacheHintBytes` is the Intel Cache region offset, or
     // UINT64_MAX to auto-scan (slow).
@@ -101,6 +111,7 @@ private:
     std::vector<PreparedVol> openedVols_;
     std::string openError_;
     std::string openWarning_;  // non-fatal: shown, then the open continues
+    std::string openInfo_;     // e.g. the RAID geometry we settled on
 
     QTreeWidget* tree_ = nullptr;
     HexView* hex_ = nullptr;

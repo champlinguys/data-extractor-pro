@@ -10,6 +10,8 @@
 #include "bitlocker/fve.h"
 #include "bitlocker/keys.h"
 #include "bitlocker/volume.h"
+#include "raid/raid.h"
+#include "raid/raid_detect.h"
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -24,11 +26,133 @@ using namespace de;
 static void usage() {
     std::fprintf(stderr,
         "usage:\n"
-        "  de-cli <image>                       list partitions & filesystems\n"
-        "  de-cli <image> ls <part#> [recno]    list a directory (default root)\n"
-        "  de-cli <image> cat <part#> <recno>   dump a file's data to stdout\n"
-        "  de-cli <image> extract <part#> <recno> <out>  write a file to disk\n"
-        "  de-cli <optane> imsm [hintSector]   parse Intel IMSM/RST metadata\n");
+        "  de-cli <source>                      list partitions & filesystems\n"
+        "  de-cli <source> ls <part#> [recno]   list a directory (default root)\n"
+        "  de-cli <source> cat <part#> <recno>  dump a file's data to stdout\n"
+        "  de-cli <source> extract <part#> <recno> <out>   write one file\n"
+        "  de-cli <source> export <part#> <recno> <outdir> recursively export a\n"
+        "                                       folder, preserving dates\n"
+        "  de-cli <optane> imsm [hintSector]    parse Intel IMSM/RST metadata\n"
+        "\n"
+        "<source> is an image file, a device (/dev/sdc), or a RAID set:\n"
+        "  raid:auto:/dev/sdc,/dev/sdd          work the geometry out and verify it\n"
+        "  raid:stripe:128k:/dev/sdc,/dev/sdd   RAID 0 with a known stripe size\n"
+        "  raid:concat:/dev/sdc,/dev/sdd        spanned / JBOD\n"
+        "  raid:mirror:/dev/sdc,/dev/sdd        RAID 1\n"
+        "\n"
+        "  de-cli raid <dev> <dev> [...]        analyse a set and show the\n"
+        "                                       geometries that fit, best first\n");
+}
+
+// Split "a,b,c" into its parts.
+static std::vector<std::string> splitCommas(const std::string& s) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t comma = s.find(',', start);
+        if (comma == std::string::npos) {
+            out.push_back(s.substr(start));
+            break;
+        }
+        out.push_back(s.substr(start, comma - start));
+        start = comma + 1;
+    }
+    return out;
+}
+
+// "128k", "1M", "65536" -> bytes.
+static uint64_t parseSize(const std::string& s) {
+    char* end = nullptr;
+    uint64_t v = std::strtoull(s.c_str(), &end, 10);
+    if (end && (*end == 'k' || *end == 'K')) v *= 1024;
+    else if (end && (*end == 'm' || *end == 'M')) v *= 1024 * 1024;
+    return v;
+}
+
+static std::shared_ptr<ImageSource> openRaw(const std::string& path) {
+    try {
+        return std::make_shared<RawImageSource>(path);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s\n", e.what());
+        return nullptr;
+    }
+}
+
+// Turn a source spec into one addressable disk. A plain path opens as-is; a
+// "raid:..." spec assembles the members, either from a geometry the user
+// states or by working it out and verifying it against the filesystems found.
+static std::shared_ptr<ImageSource> openSource(const std::string& spec) {
+    if (spec.rfind("raid:", 0) != 0) return openRaw(spec);
+
+    std::string rest = spec.substr(5);
+    size_t colon = rest.find(':');
+    if (colon == std::string::npos) { usage(); return nullptr; }
+    std::string mode = rest.substr(0, colon);
+    rest = rest.substr(colon + 1);
+
+    uint64_t stripe = 64 * 1024;
+    if (mode == "stripe") {
+        size_t c2 = rest.find(':');
+        if (c2 == std::string::npos) { usage(); return nullptr; }
+        stripe = parseSize(rest.substr(0, c2));
+        rest = rest.substr(c2 + 1);
+    }
+
+    std::vector<std::shared_ptr<ImageSource>> devs;
+    for (const auto& path : splitCommas(rest)) {
+        if (path.empty()) continue;
+        auto d = openRaw(path);
+        if (!d) return nullptr;
+        devs.push_back(std::move(d));
+    }
+    if (devs.empty()) { usage(); return nullptr; }
+
+    if (mode == "auto") {
+        std::fprintf(stderr, "working out the RAID geometry (this reads a little "
+                             "from each drive)...\n");
+        auto r = de::raid::detect(devs);
+        for (const auto& n : r.notes) std::fprintf(stderr, "  %s\n", n.c_str());
+        if (!r.assembled) {
+            std::fprintf(stderr, "could not reassemble these drives: %s\n",
+                         r.summary.c_str());
+            std::fprintf(stderr, "you can still force a geometry, e.g. "
+                                 "raid:stripe:128k:<dev>,<dev>\n");
+            return nullptr;
+        }
+        std::fprintf(stderr, "using %s\n", r.summary.c_str());
+        return de::raid::assemble(r.layout);
+    }
+
+    de::raid::Layout layout;
+    layout.stripeBytes = stripe;
+    layout.origin = "specified on the command line";
+    if (mode == "stripe") layout.level = de::raid::Level::Stripe;
+    else if (mode == "concat") layout.level = de::raid::Level::Concat;
+    else if (mode == "mirror") layout.level = de::raid::Level::Mirror;
+    else { usage(); return nullptr; }
+    for (auto& d : devs) {
+        de::raid::Member m;
+        m.label = d->name();
+        m.src = std::move(d);
+        layout.members.push_back(std::move(m));
+    }
+    auto disk = de::raid::assemble(layout);
+    if (!disk) {
+        std::fprintf(stderr, "that geometry is not usable (check the stripe size)\n");
+        return nullptr;
+    }
+    // Say whether the forced geometry actually holds up, rather than letting a
+    // wrong stripe size quietly produce shredded files.
+    std::string ev;
+    bool fsVerified = false;
+    int score = de::raid::scoreAssembled(disk, true, &ev, &fsVerified);
+    std::fprintf(stderr, "%s\n  verification: %s\n", layout.describe().c_str(),
+                 ev.c_str());
+    if (score < 12 || !fsVerified)
+        std::fprintf(stderr, "  WARNING: this geometry does not verify - the "
+                             "filesystems on it do not parse. Anything you "
+                             "export may be corrupt.\n");
+    return disk;
 }
 
 // Resolve a partition and mount its filesystem, or return nullptr with a message.
@@ -64,8 +188,124 @@ static std::shared_ptr<ImageSource> reconstruct(std::shared_ptr<ImageSource> qlc
     return qlc;
 }
 
+// Recursively export a subtree, preserving dates and resource forks. This is
+// the workflow that matters when the destination is smaller than the source:
+// pick one folder, take only that.
+static int exportTree(Filesystem& fs, const FsNode& start, const std::string& outRoot) {
+    uint64_t files = 0, bytes = 0, failed = 0;
+    std::function<void(const FsNode&, const std::string&)> rec =
+        [&](const FsNode& dir, const std::string& path) {
+            std::error_code ec;
+            std::filesystem::create_directories(path, ec);
+            for (auto& c : fs.listDir(dir)) {
+                std::string safe = c.name;
+                for (auto& ch : safe)
+                    if (ch == '/' || ch == '\\' || static_cast<unsigned char>(ch) < 0x20)
+                        ch = '_';
+                if (safe.empty() || safe == "." || safe == "..") safe = "unnamed";
+                std::string cp = path + "/" + safe;
+                if (c.isDir) {
+                    rec(c, cp);
+                    // After its contents, which would otherwise bump its mtime.
+                    de::applyFileTimes(cp, fs.fileTimes(c));
+                    continue;
+                }
+                std::ofstream os(cp, std::ios::binary);
+                if (!os) { ++failed; continue; }
+                uint64_t before = bytes;
+                bool ok = fs.readFileStream(c, [&](const uint8_t* d, size_t n) {
+                    os.write(reinterpret_cast<const char*>(d),
+                             static_cast<std::streamsize>(n));
+                    bytes += n;
+                    return static_cast<bool>(os);
+                });
+                os.close();
+                if (!ok) {
+                    ++failed;
+                    std::fprintf(stderr, "  could not fully read: %s\n", cp.c_str());
+                }
+                ++files;
+                de::FsTimes t = fs.fileTimes(c);
+                if (auto rsrc = fs.readResourceFork(c); !rsrc.empty()) {
+                    std::ofstream rs(cp + ".rsrc", std::ios::binary);
+                    rs.write(reinterpret_cast<const char*>(rsrc.data()),
+                             static_cast<std::streamsize>(rsrc.size()));
+                    bytes += rsrc.size();
+                    rs.close();
+                    de::applyFileTimes(cp + ".rsrc", t);
+                }
+                de::applyFileTimes(cp, t);
+                if (files % 200 == 0)
+                    std::fprintf(stderr, "\r  %llu files, %.2f GB...",
+                                 (unsigned long long)files, bytes / 1e9);
+                (void)before;
+            }
+        };
+    rec(start, outRoot);
+    std::fprintf(stderr, "\rexported %llu files, %.2f GB to %s\n",
+                 (unsigned long long)files, bytes / 1e9, outRoot.c_str());
+    if (failed)
+        std::fprintf(stderr, "%llu file(s) could not be read in full\n",
+                     (unsigned long long)failed);
+    return failed ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { usage(); return 2; }
+
+    // Analyse a set of drives and report the geometries that fit.
+    // `de-cli raid <dev> <dev> [...]`
+    if (std::string(argv[1]) == "raid") {
+        if (argc < 4) { usage(); return 2; }
+        std::vector<std::shared_ptr<ImageSource>> devs;
+        for (int i = 2; i < argc; ++i) {
+            auto d = openRaw(argv[i]);
+            if (!d) return 1;
+            std::printf("member: %s (%.2f TB)\n", argv[i], d->size() / 1e12);
+            devs.push_back(std::move(d));
+        }
+        auto r = de::raid::detect(devs);
+        std::printf("\n");
+        for (const auto& n : r.notes) std::printf("note: %s\n", n.c_str());
+        if (!r.standalone.empty()) {
+            std::printf("\n%zu of these drives read as complete disks on their "
+                        "own - if that is unexpected, they may not belong to a "
+                        "set at all.\n", r.standalone.size());
+        }
+        std::printf("\ngeometries tried, best first:\n");
+        for (const auto& c : r.ranked)
+            std::printf("  [%3d] %-58s %s\n", c.score, c.layout.describe().c_str(),
+                        c.evidence.c_str());
+        std::printf("\n");
+        if (r.assembled) {
+            std::printf("RESULT: %s\n", r.summary.c_str());
+            std::string spec = "raid:";
+            switch (r.layout.level) {
+                case de::raid::Level::Stripe:
+                    spec += "stripe:" + std::to_string(r.layout.stripeBytes / 1024) + "k:";
+                    break;
+                case de::raid::Level::Concat: spec += "concat:"; break;
+                case de::raid::Level::Mirror: spec += "mirror:"; break;
+            }
+            for (size_t i = 0; i < r.layout.members.size(); ++i)
+                spec += (i ? "," : "") + r.layout.members[i].label;
+            std::printf("\nuse it with:\n  de-cli '%s'\n", spec.c_str());
+            // Show what is actually on the assembled disk.
+            auto disk = de::raid::assemble(r.layout);
+            std::printf("\npartitions on the assembled disk:\n");
+            for (auto& p : scanPartitions(disk)) {
+                auto vol = p.asSource(disk);
+                std::printf("  [%d] %-8s @ sector %llu, %.2f GB  type=%s  fs=%s\n",
+                            p.index, p.scheme.c_str(),
+                            (unsigned long long)(p.firstByte / 512),
+                            p.lengthBytes / 1e9, p.typeName.c_str(),
+                            detectFilesystemName(*vol).c_str());
+            }
+            return 0;
+        }
+        std::printf("RESULT: %s\n", r.summary.c_str());
+        return 1;
+    }
 
     // Dump BitLocker FVE metadata from the reconstructed BitLocker partition.
     // `de-cli bde <qlc> <optane> [cacheHintSector]`
@@ -268,13 +508,8 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::shared_ptr<ImageSource> img;
-    try {
-        img = std::make_shared<RawImageSource>(argv[1]);
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "%s\n", e.what());
-        return 1;
-    }
+    std::shared_ptr<ImageSource> img = openSource(argv[1]);
+    if (!img) return 1;
 
     if (argc == 2) {
         auto parts = scanPartitions(img);
@@ -325,6 +560,16 @@ int main(int argc, char** argv) {
                         (unsigned long long)c.size, c.name.c_str());
         }
         return 0;
+    }
+
+    if (cmd == "export") {
+        if (argc < 6) { usage(); return 2; }
+        auto fs = mount(img, std::atoi(argv[3]), vol);
+        if (!fs) return 1;
+        FsNode start = fs->root();
+        uint64_t id = std::strtoull(argv[4], nullptr, 10);
+        if (id != start.id) { start.id = id; start.isDir = true; start.name.clear(); }
+        return exportTree(*fs, start, argv[5]);
     }
 
     if (cmd == "cat" || cmd == "extract") {
