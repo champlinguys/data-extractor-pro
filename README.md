@@ -118,6 +118,29 @@ checked before you rely on it. In the GUI it is
 workflow when the destination is smaller than the source: browse, pick the
 folders you need, take only those.
 
+## Finding things, and listing the whole volume
+
+Deciding what to recover first means seeing what is there. Search every name
+on the volume, or write the entire listing to a file you can keep and search
+yourself:
+
+```sh
+de-cli disk.img find 2 osage wetland      # case-insensitive, prints full paths
+de-cli disk.img tree 2 listing.txt        # every object: size, date, full path
+de-cli disk.img tree 2 listing.html       # same, with a search box
+de-cli disk.img tree 2 listing.txt listing.html --dirs-only
+```
+
+Both formats come from a single pass over the catalog, so asking for both
+costs no more than asking for one - worth knowing on a volume where the walk
+takes minutes. The HTML page is self-contained (no network, no external
+files): folders expand on click, and typing filters every path on the volume,
+plain substring or regular expression. It holds the listing as data and
+renders only what is on screen, so half a million files stays responsive.
+
+On a 32 TB volume with 617,509 files the walk takes about ten minutes and
+produces a 62 MB text listing or a 29 MB HTML page.
+
 ### How the geometry is worked out
 
 Guessing wrong is worse than failing, because a wrong stripe size yields a

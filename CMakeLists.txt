@@ -30,6 +30,7 @@ add_library(de_engine STATIC
   src/fs/hfsplus/hfsplus.cpp
   src/raid/raid.cpp
   src/raid/raid_detect.cpp
+  src/report/tree_report.cpp
   src/optane/imsm.cpp
   src/optane/optane_merge.cpp
   src/optane/span_map.cpp

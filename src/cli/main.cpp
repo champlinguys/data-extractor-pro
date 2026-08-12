@@ -12,6 +12,7 @@
 #include "bitlocker/volume.h"
 #include "raid/raid.h"
 #include "raid/raid_detect.h"
+#include "report/tree_report.h"
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -32,6 +33,11 @@ static void usage() {
         "  de-cli <source> extract <part#> <recno> <out>   write one file\n"
         "  de-cli <source> export <part#> <recno> <outdir> recursively export a\n"
         "                                       folder, preserving dates\n"
+        "  de-cli <source> find <part#> <word> [word...]   search every folder and\n"
+        "                                       file name; prints full paths\n"
+        "  de-cli <source> tree <part#> <out.txt> [out.html] [--dirs-only]\n"
+        "                                       write the whole listing to a file\n"
+        "                                       (.html gets a search box)\n"
         "  de-cli <optane> imsm [hintSector]    parse Intel IMSM/RST metadata\n"
         "\n"
         "<source> is an image file, a device (/dev/sdc), or a RAID set:\n"
@@ -570,6 +576,76 @@ int main(int argc, char** argv) {
         uint64_t id = std::strtoull(argv[4], nullptr, 10);
         if (id != start.id) { start.id = id; start.isDir = true; start.name.clear(); }
         return exportTree(*fs, start, argv[5]);
+    }
+
+    if (cmd == "find") {
+        if (argc < 5) { usage(); return 2; }
+        auto fs = mount(img, std::atoi(argv[3]), vol);
+        if (!fs) return 1;
+        std::vector<std::string> needles;
+        for (int i = 4; i < argc; ++i) needles.push_back(argv[i]);
+
+        de::report::Options opt;
+        opt.progress = [](uint64_t f, uint64_t d) {
+            std::fprintf(stderr, "\r  searching... %llu files, %llu folders",
+                         (unsigned long long)f, (unsigned long long)d);
+        };
+        uint64_t hits = 0;
+        auto stats = de::report::findNames(
+            *fs, fs->root(), needles,
+            [&](const std::string& path, const FsNode& n) {
+                ++hits;
+                // Print as we go: on a big volume the first answers are useful
+                // long before the walk finishes.
+                std::printf("%-9s %14llu  %s\n", n.isDir ? "<DIR>" : "",
+                            (unsigned long long)n.size, path.c_str());
+                std::fflush(stdout);
+            },
+            opt);
+        std::fprintf(stderr, "\r%llu match(es) among %llu files and %llu folders\n",
+                     (unsigned long long)hits, (unsigned long long)stats.files,
+                     (unsigned long long)stats.dirs);
+        return hits ? 0 : 1;
+    }
+
+    if (cmd == "tree") {
+        if (argc < 5) { usage(); return 2; }
+        auto fs = mount(img, std::atoi(argv[3]), vol);
+        if (!fs) return 1;
+        std::vector<std::string> outputs;
+        de::report::Options opt;
+        for (int i = 4; i < argc; ++i) {
+            if (std::string(argv[i]) == "--dirs-only") opt.includeFiles = false;
+            else outputs.push_back(argv[i]);
+        }
+        if (outputs.empty()) { usage(); return 2; }
+        opt.progress = [](uint64_t f, uint64_t d) {
+            std::fprintf(stderr, "\r  listing... %llu files, %llu folders",
+                         (unsigned long long)f, (unsigned long long)d);
+        };
+        // Walking a 32 TB volume takes minutes, so do it once and write every
+        // requested format from the one pass.
+        de::report::Stats stats;
+        auto entries = de::report::collectTree(*fs, fs->root(), stats, opt);
+        std::fprintf(stderr, "\r  listed %llu files, %llu folders; writing...\n",
+                     (unsigned long long)stats.files, (unsigned long long)stats.dirs);
+        for (const auto& outPath : outputs) {
+            std::ofstream os(outPath, std::ios::binary);
+            if (!os) {
+                std::fprintf(stderr, "cannot write %s\n", outPath.c_str());
+                return 1;
+            }
+            bool html = outPath.size() > 5 &&
+                        outPath.compare(outPath.size() - 5, 5, ".html") == 0;
+            if (html) de::report::writeHtmlTree(entries, os, img->name());
+            else de::report::writeTextTree(entries, os);
+            os.close();
+            std::fprintf(stderr, "wrote %s\n", outPath.c_str());
+        }
+        std::fprintf(stderr, "%llu files, %llu folders, %.2f GB of data\n",
+                     (unsigned long long)stats.files,
+                     (unsigned long long)stats.dirs, stats.bytes / 1e9);
+        return 0;
     }
 
     if (cmd == "cat" || cmd == "extract") {
