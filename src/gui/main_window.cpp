@@ -4,6 +4,7 @@
 #include "gui/preferences_dialog.h"
 #include "gui/device_picker.h"
 #include "core/file_times.h"
+#include "core/file_owner.h"
 #include "partition/partition.h"
 #include "raid/raid.h"
 #include "raid/raid_detect.h"
@@ -894,6 +895,7 @@ void MainWindow::exportWalk(Filesystem* fs, const FsNode& node, const QString& d
     QString outPath = QDir(destDir).filePath(safe);
     if (node.isDir) {
         QDir().mkpath(outPath);
+        de::applyInvokingOwner(outPath.toStdString());
         for (const auto& c : fs->listDir(node)) {
             exportWalk(fs, c, outPath);
             if (exportCancel_.load()) return;
@@ -954,6 +956,10 @@ void MainWindow::exportWalk(Filesystem* fs, const FsNode& node, const QString& d
                 de::applyFileTimes(outPath.toStdString(), t);
                 if (wroteRsrc) de::applyFileTimes((outPath + ".rsrc").toStdString(), t);
             }
+            // Unconditional, unlike the dates: the customer needs to be able to
+            // read the file whether or not they asked to keep the timeline.
+            de::applyInvokingOwner(outPath.toStdString());
+            if (wroteRsrc) de::applyInvokingOwner((outPath + ".rsrc").toStdString());
             if (md) {  // write "<hex>  <filename>" sidecar next to the file
                 unsigned char dig[EVP_MAX_MD_SIZE]; unsigned int dl = 0;
                 EVP_DigestFinal_ex(md, dig, &dl);
@@ -962,6 +968,8 @@ void MainWindow::exportWalk(Filesystem* fs, const FsNode& node, const QString& d
                 for (unsigned i = 0; i < dl; ++i) { hex += h[dig[i] >> 4]; hex += h[dig[i] & 0xF]; }
                 std::ofstream sc((outPath + sidecarExt).toStdString());
                 sc << hex << "  " << QFileInfo(outPath).fileName().toStdString() << "\n";
+                sc.close();
+                de::applyInvokingOwner((outPath + sidecarExt).toStdString());
             }
         } else {
             ++exportFails_;

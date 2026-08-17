@@ -3,6 +3,7 @@
 // the GUI.
 #include "core/image_source.h"
 #include "core/file_times.h"
+#include "core/file_owner.h"
 #include "partition/partition.h"
 #include "fs/filesystem.h"
 #include "optane/imsm.h"
@@ -203,6 +204,7 @@ static int exportTree(Filesystem& fs, const FsNode& start, const std::string& ou
         [&](const FsNode& dir, const std::string& path) {
             std::error_code ec;
             std::filesystem::create_directories(path, ec);
+            de::applyInvokingOwner(path);
             for (auto& c : fs.listDir(dir)) {
                 std::string safe = c.name;
                 for (auto& ch : safe)
@@ -239,8 +241,10 @@ static int exportTree(Filesystem& fs, const FsNode& start, const std::string& ou
                     bytes += rsrc.size();
                     rs.close();
                     de::applyFileTimes(cp + ".rsrc", t);
+                    de::applyInvokingOwner(cp + ".rsrc");
                 }
                 de::applyFileTimes(cp, t);
+                de::applyInvokingOwner(cp);
                 if (files % 200 == 0)
                     std::fprintf(stderr, "\r  %llu files, %.2f GB...",
                                  (unsigned long long)files, bytes / 1e9);
@@ -439,6 +443,7 @@ int main(int argc, char** argv) {
                 std::function<void(uint64_t, const std::string&)> rec =
                     [&](uint64_t dirId, const std::string& path) {
                         std::filesystem::create_directories(path);
+                        de::applyInvokingOwner(path);
                         de::FsNode d; d.id = dirId; d.isDir = true;
                         for (auto& c : fs->listDir(d)) {
                             std::string safe = c.name;
@@ -466,10 +471,12 @@ int main(int argc, char** argv) {
                                     bytes += rsrc.size();
                                     rs.close();
                                     de::applyFileTimes(cp + ".rsrc", t);
+                                    de::applyInvokingOwner(cp + ".rsrc");
                                 }
                                 // Restore the source dates, so a scripted export
                                 // uploads with the same timeline as the GUI's.
                                 de::applyFileTimes(cp, t);
+                                de::applyInvokingOwner(cp);
                             }
                         }
                     };
@@ -671,9 +678,11 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "wrote %zu bytes to %s\n", rsrc.size(), rsrcPath.c_str());
                 rs.close();
                 de::applyFileTimes(rsrcPath, fs->fileTimes(f));
+                de::applyInvokingOwner(rsrcPath);
             }
             out.close();
             de::applyFileTimes(argv[5], fs->fileTimes(f));
+            de::applyInvokingOwner(argv[5]);
         }
         return 0;
     }
