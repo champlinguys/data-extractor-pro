@@ -11,6 +11,8 @@
 #include "optane/span_map.h"
 #include "bitlocker/volume.h"
 #include "bitlocker/fve.h"
+#include "corestorage/cs.h"
+#include "corestorage/source.h"
 
 #include <QApplication>
 #include <QFileDialog>
@@ -56,7 +58,8 @@ constexpr int RoleIsDir   = Qt::UserRole + 3;
 constexpr int RoleSize    = Qt::UserRole + 4;
 constexpr int RoleLoaded  = Qt::UserRole + 5;   // lazy-load guard
 constexpr int RoleName    = Qt::UserRole + 6;
-constexpr int RoleLocked  = Qt::UserRole + 7;   // partition is a locked BitLocker volume
+constexpr int RoleLocked  = Qt::UserRole + 7;   // partition is a locked encrypted volume
+constexpr int RoleCrypto  = Qt::UserRole + 8;   // "bitlocker" or "corestorage"
 
 QString humanSize(uint64_t n) {
     const char* u[] = {"B", "KiB", "MiB", "GiB", "TiB"};
@@ -568,12 +571,20 @@ void MainWindow::buildTree(const std::vector<PreparedVol>& vols, const QString& 
         // Offer the right-click unlock only where a key can actually help: a
         // locked volume or a wrong-key attempt. A "cipher not supported yet"
         // row is a correct-key dead end, so it gets no unlock action.
-        bool unlockable = fsName.startsWith("BitLocker (encrypted)") ||
-                          fsName.startsWith("BitLocker (unlock failed");
+        bool bdeLocked = fsName.startsWith("BitLocker (encrypted)") ||
+                         fsName.startsWith("BitLocker (unlock failed");
+        bool csLocked  = fsName.startsWith("CoreStorage / FileVault 2") ||
+                         fsName.startsWith("FileVault 2 (unlock failed");
+        bool unlockable = bdeLocked || csLocked;
         item->setData(0, RoleLocked, unlockable);
-        if (unlockable)
+        item->setData(0, RoleCrypto,
+                      csLocked ? QString("corestorage") : QString("bitlocker"));
+        if (bdeLocked)
             item->setToolTip(0, "Locked BitLocker volume - right-click to enter "
                                 "the recovery key");
+        else if (csLocked)
+            item->setToolTip(0, "Locked FileVault 2 volume - right-click to enter "
+                                "the volume key");
         // Add the lazy-load placeholder (what gives the row its expand arrow)
         // only for a filesystem detectFilesystem() can mount: not a stub label
         // ("... not yet implemented"), not an unrecognised volume, and not any
@@ -581,9 +592,12 @@ void MainWindow::buildTree(const std::vector<PreparedVol>& vols, const QString& 
         // cipher we can't decrypt).
         bool bitlockerNotBrowsable =
             fsName.startsWith("BitLocker") && !fsName.contains("unlocked");
+        bool corestorageNotBrowsable =
+            (fsName.startsWith("CoreStorage") || fsName.startsWith("FileVault 2")) &&
+            !fsName.contains("unlocked");
         bool browsable = !fsName.contains("not yet implemented") &&
                           fsName != "Unknown" &&
-                          !bitlockerNotBrowsable;
+                          !bitlockerNotBrowsable && !corestorageNotBrowsable;
         if (browsable)
             item->addChild(new QTreeWidgetItem({QString("...")}));
     }
@@ -600,9 +614,15 @@ void MainWindow::showTreeMenu(const QPoint& pos) {
 
     QMenu menu(this);
     if (item->data(0, RoleLocked).toBool()) {
-        QAction* unlock = menu.addAction("Unlock BitLocker...");
-        connect(unlock, &QAction::triggered, this,
-                [this, item] { unlockBitLockerItem(item); });
+        bool cs = item->data(0, RoleCrypto).toString() == "corestorage";
+        QAction* unlock = menu.addAction(cs ? "Unlock FileVault 2..."
+                                            : "Unlock BitLocker...");
+        if (cs)
+            connect(unlock, &QAction::triggered, this,
+                    [this, item] { unlockCoreStorageItem(item); });
+        else
+            connect(unlock, &QAction::triggered, this,
+                    [this, item] { unlockBitLockerItem(item); });
     }
     if (!menu.isEmpty())
         menu.exec(tree_->viewport()->mapToGlobal(pos));
@@ -702,6 +722,87 @@ void MainWindow::unlockBitLockerItem(QTreeWidgetItem* partitionItem) {
     partitionItem->addChild(new QTreeWidgetItem({QString("...")}));
     partitionItem->setExpanded(true);
     status_->setText("BitLocker volume unlocked.");
+}
+
+void MainWindow::unlockCoreStorageItem(QTreeWidgetItem* partitionItem) {
+    int part = partitionItem->data(0, RolePart).toInt();
+    auto vit = volumes_.find(part);
+    if (vit == volumes_.end() || !vit->second) return;
+
+    bool ok = false;
+    QString keyText = QInputDialog::getText(
+        this, "Unlock FileVault 2",
+        "Enter the CoreStorage volume key for this volume, in hex\n"
+        "(64 characters for AES-XTS-128):",
+        QLineEdit::Normal, QString(), &ok);
+    keyText = keyText.trimmed();
+    if (!ok || keyText.isEmpty()) return;
+
+    auto key = de::corestorage::parseVolumeKey(keyText.toStdString());
+    if (!key) {
+        QMessageBox::warning(this, "Unlock FileVault 2",
+            "That is not a usable volume key.\n\n"
+            "It must be 64 hex characters for AES-XTS-128 (a 32-byte key), or "
+            "128 for AES-XTS-256.");
+        return;
+    }
+
+    // Finding the logical volume means trial-decrypting a sector per candidate
+    // offset over what may be a slow image, so run it on a worker thread behind
+    // a modal busy dialog - the same pattern as the BitLocker unlock above.
+    std::shared_ptr<ImageSource> enc = vit->second;
+    std::shared_ptr<ImageSource> dec;
+    std::string note;
+    std::atomic<bool> done{false};
+
+    QProgressDialog progress("Looking for the logical volume and checking the key...\n"
+                             "This can take a moment.", QString(), 0, 0, this);
+    progress.setWindowTitle("Unlocking");
+    progress.setWindowModality(Qt::ApplicationModal);
+    progress.setCancelButton(nullptr);   // the unlock isn't interruptible
+    progress.setMinimumDuration(0);
+
+    std::thread worker([&] {
+        dec = de::corestorage::unlockVolume(enc, *key, &note);
+        done = true;
+    });
+    QTimer timer;
+    connect(&timer, &QTimer::timeout, this, [&] {
+        if (done.load()) progress.accept();
+    });
+    timer.start(80);
+    progress.exec();
+    timer.stop();
+    worker.join();
+
+    if (!dec) {
+        QMessageBox::warning(this, "Unlock FileVault 2",
+            QString("Could not unlock this volume.\n\n%1")
+                .arg(QString::fromStdString(note)));
+        QString typeName = QString(partitionItem->text(0)).section('(', 0, 0).trimmed();
+        partitionItem->setText(0, QString("%1  (FileVault 2 (unlock failed - wrong key?))")
+                                      .arg(typeName));
+        return;
+    }
+
+    // Swap the decrypted view in, drop any stale mount, and turn the row into a
+    // browsable one with a fresh lazy placeholder.
+    volumes_[part] = dec;
+    mounts_.erase(part);
+    partitionItem->setData(0, RoleLocked, false);
+    partitionItem->setData(0, RoleLoaded, false);
+    partitionItem->setToolTip(0, QString());
+
+    QString fsName = QString::fromStdString(detectFilesystemName(*dec))
+                         + "  (FileVault 2 unlocked)";
+    QString typeName = QString(partitionItem->text(0)).section('(', 0, 0).trimmed();
+    partitionItem->setText(0, QString("%1  (%2)").arg(typeName).arg(fsName));
+
+    while (partitionItem->childCount() > 0)
+        delete partitionItem->takeChild(0);
+    partitionItem->addChild(new QTreeWidgetItem({QString("...")}));
+    partitionItem->setExpanded(true);
+    status_->setText(QString::fromStdString("FileVault 2 volume unlocked - " + note));
 }
 
 Filesystem* MainWindow::mountFor(QTreeWidgetItem* partitionItem) {

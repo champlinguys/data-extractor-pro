@@ -38,6 +38,8 @@ add_library(de_engine STATIC
   src/bitlocker/fve.cpp
   src/bitlocker/keys.cpp
   src/bitlocker/volume.cpp
+  src/corestorage/cs.cpp
+  src/corestorage/source.cpp
 )
 target_include_directories(de_engine PUBLIC src)
 target_compile_options(de_engine PRIVATE -Wall -Wextra)

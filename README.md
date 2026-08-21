@@ -43,6 +43,17 @@ Status:
   right-click a locked BitLocker partition to unlock it in place. The AES-XTS
   path is validated byte-for-byte against a reference recovery tool on a real
   Optane H10 case; the Elephant-diffuser CBC variants are not yet supported.
+- **FileVault 2 / CoreStorage decryption** - working, given the volume key:
+  AES-XTS decryption of the CoreStorage logical volume, then browse/extract the
+  HFS+ inside. Right-click a locked FileVault 2 partition to unlock it in place,
+  or pass `--volume-key <hex>` to the CLI. The logical volume's start is found
+  by trial-decrypting the HFS+ header rather than assumed, so a key that
+  verifies has proved the offset with it. Validated byte-for-byte against
+  libfvde on a real 12.73 TiB FileVault 2 case (20/20 exact 4 KiB matches from
+  1 KiB to 928 GiB), and - unlike libfvde, which refuses every read past 1 TiB -
+  it reads the whole volume: files at 1.25-1.54 TiB extract intact.
+  Deriving the volume key from the user's passphrase is not implemented yet;
+  the key is supplied ready-made.
 
 - **Classic HFS (pre-HFS+)** - working: the 1985-1998 Macintosh filesystem
   found on old Mac floppies and small disks, which mainstream tools (Sleuth
@@ -179,6 +190,20 @@ de-cli browse <qlc.img> <optane.img> <cacheHintSector> <recovery-key> [cat <recn
 ```
 `cacheHintSector` is the Intel Cache region start (skips a slow device scan);
 find it with `de-cli imsm <optane.img>` if unknown.
+
+## FileVault 2 (CoreStorage) workflow (CLI)
+
+```sh
+# identify the CoreStorage volume and check whether a key unlocks it
+de-cli <image> cs 2 --volume-key <hex>
+# browse, search and export the HFS+ volume inside
+de-cli <image> ls      2         --volume-key <hex>
+de-cli <image> find    2 <word>  --volume-key <hex>
+de-cli <image> export  2 <recno> <outdir> --volume-key <hex>
+```
+The volume key is the AES-XTS key pair (cipher key followed by tweak key)
+as hex: 64 characters for AES-XTS-128, 128 for AES-XTS-256. `--volume-key`
+may appear anywhere on the command line.
 
 ## Building
 

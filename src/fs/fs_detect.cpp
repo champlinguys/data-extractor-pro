@@ -3,6 +3,7 @@
 #include "fs/hfs/hfs.h"
 #include "fs/apfs/apfs.h"
 #include "fs/hfsplus/hfsplus.h"
+#include "corestorage/cs.h"
 #include <cstring>
 
 namespace de {
@@ -14,10 +15,19 @@ std::string detectFilesystemName(ImageSource& vol) {
     if (HfsPlusFilesystem::probe(vol)) return "HFS+";
 
     // BitLocker volume: FVE boot record signature at offset 3.
-    uint8_t vbr[512];
-    if (vol.readAt(0, vbr, sizeof vbr) >= 11 &&
-        std::memcmp(vbr + 3, "-FVE-FS-", 8) == 0)
+    uint8_t vbr[512] = {};
+    size_t vbrLen = vol.readAt(0, vbr, sizeof vbr);
+    if (vbrLen >= 11 && std::memcmp(vbr + 3, "-FVE-FS-", 8) == 0)
         return "BitLocker (encrypted)";
+
+    // CoreStorage (FileVault 2): the volume's own header, not the GPT type, so
+    // this still labels the volume correctly when the partition table is gone.
+    if (de::corestorage::looksLikeCoreStorage(vbr, vbrLen)) {
+        if (auto h = de::corestorage::parseHeader(vol))
+            return h->isEncrypted() ? "CoreStorage / FileVault 2 (encrypted)"
+                                    : "CoreStorage (unencrypted)";
+        return "CoreStorage / FileVault 2 (encrypted)";
+    }
 
     // Cheap signature sniffing for the filesystems still on the roadmap, so the
     // UI can label volumes it can't yet browse.

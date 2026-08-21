@@ -47,6 +47,7 @@ private:
     // Prompt for a recovery key and, if it unlocks `partitionItem`'s volume,
     // swap in the decrypted source and turn the row into a browsable one.
     void unlockBitLockerItem(QTreeWidgetItem* partitionItem);
+    void unlockCoreStorageItem(QTreeWidgetItem* partitionItem);
     void loadImage(const QString& path);
     // Assemble `devs` (modeIndex: 0 auto, 1 stripe, 2 concat, 3 mirror) and
     // load the result into the tree.

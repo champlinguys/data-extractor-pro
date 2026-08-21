@@ -11,6 +11,8 @@
 #include "bitlocker/fve.h"
 #include "bitlocker/keys.h"
 #include "bitlocker/volume.h"
+#include "corestorage/cs.h"
+#include "corestorage/source.h"
 #include "raid/raid.h"
 #include "raid/raid_detect.h"
 #include "report/tree_report.h"
@@ -21,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <optional>
 #include <filesystem>
 
 using namespace de;
@@ -39,7 +42,14 @@ static void usage() {
         "  de-cli <source> tree <part#> <out.txt> [out.html] [--dirs-only]\n"
         "                                       write the whole listing to a file\n"
         "                                       (.html gets a search box)\n"
+        "  de-cli <source> cs <part#>           show CoreStorage (FileVault 2) info\n"
         "  de-cli <optane> imsm [hintSector]    parse Intel IMSM/RST metadata\n"
+        "\n"
+        "options (anywhere on the command line):\n"
+        "  --volume-key <hex>   CoreStorage/FileVault 2 volume key, 32 bytes for\n"
+        "                       AES-XTS-128 (64 hex chars) or 64 for AES-XTS-256.\n"
+        "                       Any CoreStorage partition is decrypted with it, so\n"
+        "                       ls/export/tree/find work on the volume inside.\n"
         "\n"
         "<source> is an image file, a device (/dev/sdc), or a RAID set:\n"
         "  raid:auto:/dev/sdc,/dev/sdd          work the geometry out and verify it\n"
@@ -162,6 +172,30 @@ static std::shared_ptr<ImageSource> openSource(const std::string& spec) {
     return disk;
 }
 
+// The CoreStorage volume key from --volume-key, if one was given. Phase 1 takes
+// the key ready-made; deriving it from the passphrase is a separate job (see
+// corestorage/cs.h).
+static std::optional<de::corestorage::VolumeKey> g_csKey;
+
+// If `vol` is a CoreStorage volume and we hold a key, swap in the decrypted
+// view so the rest of the tool sees an ordinary HFS+ volume. Left untouched
+// when it is not CoreStorage, so this is safe to call on every partition.
+static void maybeUnlockCoreStorage(std::shared_ptr<ImageSource>& vol) {
+    if (!g_csKey) return;
+    uint8_t head[512] = {};
+    size_t n = vol->readAt(0, head, sizeof head);
+    if (!de::corestorage::looksLikeCoreStorage(head, n)) return;
+
+    std::string note;
+    auto dec = de::corestorage::unlockVolume(vol, *g_csKey, &note);
+    if (dec) {
+        std::fprintf(stderr, "CoreStorage: %s\n", note.c_str());
+        vol = dec;
+    } else {
+        std::fprintf(stderr, "CoreStorage: could not unlock - %s\n", note.c_str());
+    }
+}
+
 // Resolve a partition and mount its filesystem, or return nullptr with a message.
 static std::unique_ptr<Filesystem> mount(const std::shared_ptr<ImageSource>& img,
                                          int partNo, std::shared_ptr<ImageSource>& volOut) {
@@ -171,6 +205,7 @@ static std::unique_ptr<Filesystem> mount(const std::shared_ptr<ImageSource>& img
         return nullptr;
     }
     volOut = parts[partNo - 1].asSource(img);
+    maybeUnlockCoreStorage(volOut);
     auto fs = detectFilesystem(volOut);
     if (!fs) std::fprintf(stderr, "unrecognised filesystem on partition %d\n", partNo);
     return fs;
@@ -261,6 +296,27 @@ static int exportTree(Filesystem& fs, const FsNode& start, const std::string& ou
 }
 
 int main(int argc, char** argv) {
+    if (argc < 2) { usage(); return 2; }
+
+    // Pull --volume-key out of the command line before the positional parsing
+    // below, so it can be written anywhere without disturbing argument order.
+    std::vector<char*> args;
+    for (int i = 0; i < argc; ++i) {
+        if (std::string(argv[i]) == "--volume-key" && i + 1 < argc) {
+            g_csKey = de::corestorage::parseVolumeKey(argv[i + 1]);
+            if (!g_csKey) {
+                std::fprintf(stderr,
+                    "--volume-key: expected 64 hex chars (AES-XTS-128) or 128 "
+                    "(AES-XTS-256)\n");
+                return 2;
+            }
+            ++i;
+            continue;
+        }
+        args.push_back(argv[i]);
+    }
+    argv = args.data();
+    argc = static_cast<int>(args.size());
     if (argc < 2) { usage(); return 2; }
 
     // Analyse a set of drives and report the geometries that fit.
@@ -540,6 +596,49 @@ int main(int argc, char** argv) {
 
     std::string cmd = argv[2];
     std::shared_ptr<ImageSource> vol;
+
+    // Report what CoreStorage says about a partition, and - if a key was given -
+    // whether it actually unlocks. This is the "does the key work" check, kept
+    // separate from browsing so it can be run before committing to an export.
+    if (cmd == "cs") {
+        if (argc < 4) { usage(); return 2; }
+        auto parts = scanPartitions(img);
+        int partNo = std::atoi(argv[3]);
+        if (partNo < 1 || partNo > static_cast<int>(parts.size())) {
+            std::fprintf(stderr, "no such partition %d\n", partNo);
+            return 1;
+        }
+        auto vol = parts[partNo - 1].asSource(img);
+        auto h = de::corestorage::parseHeader(*vol);
+        if (!h) {
+            std::fprintf(stderr, "partition %d is not a CoreStorage volume\n", partNo);
+            return 1;
+        }
+        std::printf("CoreStorage volume on partition %d\n", partNo);
+        std::printf("  identifier        : %s\n", h->identifier.c_str());
+        std::printf("  version           : %u\n", h->version);
+        std::printf("  encryption        : %s\n", h->methodName());
+        std::printf("  block size        : %llu\n", (unsigned long long)h->blockSize);
+        std::printf("  physical volume   : %llu bytes (%.2f TiB)\n",
+                    (unsigned long long)h->physicalVolumeSize,
+                    h->physicalVolumeSize / 1099511627776.0);
+        std::printf("  metadata size     : %u (block size %u)\n",
+                    h->metadataSize, h->metadataBlockSize);
+        for (auto b : h->metadataBlocks)
+            std::printf("  metadata block    : %llu\n", (unsigned long long)b);
+        if (!g_csKey) {
+            std::printf("\n  no --volume-key given, so the volume was not unlocked\n");
+            return 0;
+        }
+        std::string note;
+        auto dec = de::corestorage::unlockVolume(vol, *g_csKey, &note);
+        if (!dec) { std::fprintf(stderr, "\n  unlock failed: %s\n", note.c_str()); return 1; }
+        std::printf("\n  unlocked: %s\n", note.c_str());
+        std::printf("  logical volume    : %llu bytes (%.2f TiB)\n",
+                    (unsigned long long)dec->size(), dec->size() / 1099511627776.0);
+        std::printf("  filesystem        : %s\n", detectFilesystemName(*dec).c_str());
+        return 0;
+    }
 
     if (cmd == "imsm") {
         uint64_t hint = UINT64_MAX;

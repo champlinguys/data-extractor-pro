@@ -32,6 +32,8 @@ std::string gptTypeName(const uint8_t* guid) {
     if (d1 == 0xC12A7328) return "EFI System";
     if (d1 == 0x48465300) return "Apple HFS+";
     if (d1 == 0x7C3457EF) return "Apple APFS";
+    if (d1 == 0x53746F72) return "Apple Core Storage";
+    if (d1 == 0x426F6F74) return "Apple Boot (Recovery)";
     if (d1 == 0xE6D6D379) return "Linux LVM";
     // All-zero GUID marks an unused table entry.
     bool zero = true;
