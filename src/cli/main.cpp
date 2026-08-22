@@ -21,6 +21,7 @@
 #include <memory>
 #include <fstream>
 #include <string>
+#include <set>
 #include <vector>
 #include <functional>
 #include <optional>
@@ -230,6 +231,14 @@ static std::shared_ptr<ImageSource> reconstruct(std::shared_ptr<ImageSource> qlc
     return qlc;
 }
 
+// "photo.jpg" + " (deleted)" -> "photo (deleted).jpg". A name with no
+// extension, or a leading dot with nothing after it, just gets the suffix.
+static std::string insertBeforeExt(const std::string& name, const std::string& suffix) {
+    size_t dot = name.rfind('.');
+    if (dot == std::string::npos || dot == 0) return name + suffix;
+    return name.substr(0, dot) + suffix + name.substr(dot);
+}
+
 // Recursively export a subtree, preserving dates and resource forks. This is
 // the workflow that matters when the destination is smaller than the source:
 // pick one folder, take only that.
@@ -240,13 +249,25 @@ static int exportTree(Filesystem& fs, const FsNode& start, const std::string& ou
             std::error_code ec;
             std::filesystem::create_directories(path, ec);
             de::applyInvokingOwner(path);
+            // Output paths already claimed in this directory.
+            std::set<std::string> used;
             for (auto& c : fs.listDir(dir)) {
                 std::string safe = c.name;
                 for (auto& ch : safe)
                     if (ch == '/' || ch == '\\' || static_cast<unsigned char>(ch) < 0x20)
                         ch = '_';
                 if (safe.empty() || safe == "." || safe == "..") safe = "unnamed";
+                // A deleted entry can share its name with the live file that
+                // replaced it (exFAT surfaces both), and two deleted entries can
+                // share a name outright. Never let one export overwrite
+                // another: mark recovered names, then number any leftover
+                // duplicates. The extension is preserved so the file still
+                // opens in whatever the user opens it with.
+                if (c.isDeleted) safe = insertBeforeExt(safe, " (deleted)");
                 std::string cp = path + "/" + safe;
+                for (int dup = 2; !used.insert(cp).second; ++dup)
+                    cp = path + "/" +
+                         insertBeforeExt(safe, " (" + std::to_string(dup) + ")");
                 if (c.isDir) {
                     rec(c, cp);
                     // After its contents, which would otherwise bump its mtime.
@@ -667,9 +688,10 @@ int main(int argc, char** argv) {
         FsNode dir = fs->root();
         if (argc >= 5) { dir.id = std::strtoull(argv[4], nullptr, 10); dir.isDir = true; }
         for (auto& c : fs->listDir(dir)) {
-            std::printf("  %-8llu %s %12llu  %s\n",
+            std::printf("  %-8llu %s %12llu  %s%s\n",
                         (unsigned long long)c.id, c.isDir ? "<DIR>" : "     ",
-                        (unsigned long long)c.size, c.name.c_str());
+                        (unsigned long long)c.size, c.name.c_str(),
+                        c.isDeleted ? "   (deleted)" : "");
         }
         return 0;
     }

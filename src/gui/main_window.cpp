@@ -13,6 +13,8 @@
 #include "bitlocker/fve.h"
 #include "corestorage/cs.h"
 #include "corestorage/source.h"
+#include <QBrush>
+#include <QColor>
 
 #include <QApplication>
 #include <QFileDialog>
@@ -820,6 +822,17 @@ Filesystem* MainWindow::mountFor(QTreeWidgetItem* partitionItem) {
 QTreeWidgetItem* MainWindow::makeNode(const FsNode& node, int partIndex, ItemKind kind) {
     auto* item = new QTreeWidgetItem;
     item->setText(0, QString::fromStdString(node.name));
+    // A recovered-but-deleted object is still exportable, but the user has to
+    // be able to tell it apart at a glance: its contents may since have been
+    // partly overwritten, and its name can collide with a live file's.
+    if (node.isDeleted) {
+        item->setForeground(0, QBrush(QColor(0xB0, 0x60, 0x00)));
+        item->setToolTip(0, QString::fromStdString(node.name) +
+                            "\n\nDeleted - recovered from a directory entry whose "
+                            "in-use flag was cleared. The data may have been "
+                            "partly or wholly overwritten since; check it after "
+                            "exporting.");
+    }
     item->setText(1, node.isDir ? QString() : humanSize(node.size));
     item->setText(2, QString::number(node.id));
     item->setData(0, RoleKind, static_cast<int>(kind));

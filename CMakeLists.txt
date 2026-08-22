@@ -29,6 +29,7 @@ add_library(de_engine STATIC
   src/fs/compression/decmpfs.cpp
   src/fs/compression/lzvn.cpp
   src/fs/hfsplus/hfsplus.cpp
+  src/fs/exfat/exfat.cpp
   src/raid/raid.cpp
   src/raid/raid_detect.cpp
   src/report/tree_report.cpp

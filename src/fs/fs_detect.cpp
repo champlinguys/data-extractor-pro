@@ -3,6 +3,7 @@
 #include "fs/hfs/hfs.h"
 #include "fs/apfs/apfs.h"
 #include "fs/hfsplus/hfsplus.h"
+#include "fs/exfat/exfat.h"
 #include "corestorage/cs.h"
 #include <cstring>
 
@@ -13,6 +14,7 @@ std::string detectFilesystemName(ImageSource& vol) {
     if (HfsFilesystem::probe(vol)) return "HFS";
     if (ApfsFilesystem::probe(vol)) return "APFS";
     if (HfsPlusFilesystem::probe(vol)) return "HFS+";
+    if (ExfatFilesystem::probe(vol)) return "exFAT";
 
     // BitLocker volume: FVE boot record signature at offset 3.
     uint8_t vbr[512] = {};
@@ -45,6 +47,7 @@ std::unique_ptr<Filesystem> detectFilesystem(std::shared_ptr<ImageSource> vol) {
     if (auto hfs = HfsFilesystem::open(vol)) return hfs;
     if (auto hfsp = HfsPlusFilesystem::open(vol)) return hfsp;
     if (auto apfs = ApfsFilesystem::open(vol)) return apfs;
+    if (auto exfat = ExfatFilesystem::open(vol)) return exfat;
     // ext4 will slot in here as it comes online.
     return nullptr;
 }

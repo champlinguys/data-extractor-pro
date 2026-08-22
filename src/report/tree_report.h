@@ -35,6 +35,7 @@ struct Entry {
     std::string name;
     int parent = -1; // index into the vector, -1 for a top-level object
     bool isDir = false;
+    bool isDeleted = false;  // recovered from a freed directory entry
     uint64_t size = 0;
     int64_t mtime = 0;
 };

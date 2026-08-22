@@ -79,6 +79,7 @@ std::vector<Entry> collectTree(Filesystem& fs, const FsNode& root, Stats& stats,
              e.name = n.name;
              e.parent = depth == 0 ? -1 : stack[depth - 1];
              e.isDir = n.isDir;
+             e.isDeleted = n.isDeleted;
              e.size = n.size;
              e.mtime = n.times.mtime;
              entries.push_back(std::move(e));
@@ -100,6 +101,8 @@ std::string entryPath(const std::vector<Entry>& entries, int i) {
 
 void writeTextTree(const std::vector<Entry>& entries, std::ostream& out) {
     out << "# size        modified          path\n";
+    out << "# a path marked [deleted] was recovered from a freed directory "
+           "entry; its data may have been partly overwritten since\n";
     for (size_t i = 0; i < entries.size(); ++i) {
         const auto& e = entries[i];
         char buf[32];
@@ -110,7 +113,8 @@ void writeTextTree(const std::vector<Entry>& entries, std::ostream& out) {
                           static_cast<unsigned long long>(e.size));
         std::string date = isoDate(e.mtime);
         out << buf << "  " << (date.empty() ? std::string(16, ' ') : date) << "  "
-            << entryPath(entries, static_cast<int>(i)) << "\n";
+            << entryPath(entries, static_cast<int>(i))
+            << (e.isDeleted ? "  [deleted]" : "") << "\n";
     }
 }
 
@@ -155,6 +159,8 @@ void writeHtmlTree(const std::vector<Entry>& entries, std::ostream& out,
  .sz,.dt{color:#888;font-variant-numeric:tabular-nums;text-align:right}
  .sz{width:90px}.dt{width:120px}
  .path{color:#888}
+ .del .nm{color:#e0a050}
+ .delmark{color:#b06000;background:#2a2010;border-radius:3px;padding:0 5px;margin-left:8px;font-size:11px}
  mark{background:#5a4a00;color:#ffd}
  .hint{color:#777;padding:10px 14px}
 </style></head><body>
@@ -167,14 +173,15 @@ void writeHtmlTree(const std::vector<Entry>& entries, std::ostream& out,
 <script>
 const N=)HTML";
 
-    // name, parent, isDir, size, mtime
+    // name, parent, isDir, size, mtime, isDeleted
     out << "[";
     for (size_t i = 0; i < nodes.size(); ++i) {
         if (i) out << ",\n";
         out << "[\"";
         jsonEscape(nodes[i].name, out);
         out << "\"," << nodes[i].parent << "," << (nodes[i].isDir ? 1 : 0) << ","
-            << nodes[i].size << "," << nodes[i].mtime / 1000000000 << "]";
+            << nodes[i].size << "," << nodes[i].mtime / 1000000000 << ","
+            << (nodes[i].isDeleted ? 1 : 0) << "]";
     }
     out << "];\n";
 
@@ -194,6 +201,10 @@ function row(i,depth,path){
  const nm=document.createElement("div"); nm.className="nm";
  nm.style.paddingLeft=(depth*18)+"px";
  nm.textContent=(n[2]?(open.has(i)?"▾ ":"▸ "):"   ")+n[0];
+ if(n[5]){d.classList.add("del");
+  const b=document.createElement("span");b.className="delmark";b.textContent=" deleted";
+  b.title="Recovered from a freed directory entry - the data may have been partly overwritten since";
+  nm.appendChild(b)}
  if(path){const s=document.createElement("span");s.className="path";s.textContent="  "+path;nm.appendChild(s)}
  if(n[2])nm.onclick=()=>{open.has(i)?open.delete(i):open.add(i);render()};
  const sz=document.createElement("div"); sz.className="sz"; sz.textContent=n[2]?"":hsize(n[3]);

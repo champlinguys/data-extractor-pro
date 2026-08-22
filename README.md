@@ -87,6 +87,18 @@ Status:
   and reported, not decrypted. Verified against synthetic containers built by
   `tools/mkapfs.py`, including a multi-level B-tree.
 
+- **exFAT** - working: the filesystem on essentially every large removable
+  drive - external USB disks over 32 GB, SDXC cards, and anything that has to
+  be readable on both Windows and macOS. Boot sector (with a fall back to the
+  backup boot region at sector 12 when the primary is damaged), FAT chains,
+  contiguous `NoFatChain` allocations, directory entry sets, UTF-16 long names
+  and the local-time-plus-UTC-offset timestamps. **Deleted files are listed and
+  recoverable**: deleting on exFAT only clears an in-use bit, so the entry set -
+  name, size and starting cluster included - usually survives intact. Verified
+  byte-for-byte against the kernel driver on a 954 GB customer drive and on
+  synthetic volumes covering fragmented, nested, Unicode-named and deleted
+  files.
+
 - **Apple transparent compression (decmpfs)** - working for both HFS+ and
   APFS: zlib and LZVN, stored in either the attribute or the resource fork.
   Without this a large share of the files on a Mac volume export as zero bytes.
@@ -254,7 +266,7 @@ filesystem parsers.
 +-----------------------------------------------------+
 | GUI (Qt5)              CLI (de-cli)                  |  front-ends
 +-----------------------------------------------------+
-| Filesystem: NTFS HFS HFS+ APFS [ext4]               |  fs/ - browse + read
+| Filesystem: NTFS HFS HFS+ APFS exFAT [ext4]         |  fs/ - browse + read
 +-----------------------------------------------------+
 | Partition scan: MBR / GPT                           |  partition/
 +-----------------------------------------------------+
@@ -267,7 +279,7 @@ The pivot is **`ImageSource`** (`src/core/image_source.h`): a raw image, a
 single-partition window, the merged Optane volume, and a decrypt-on-read
 BitLocker volume are all just byte sources. The filesystem parsers only ever see
 "a volume of bytes," so Optane reconstruction, BitLocker decryption and RAID
-reassembly are each *a new `ImageSource`, not a change to NTFS/HFS+/APFS/ext4*.
+reassembly are each *a new `ImageSource`, not a change to NTFS/HFS+/APFS/exFAT*.
 
 ### What NTFS support does today (`src/fs/ntfs/`)
 - Boot-sector geometry (sector/cluster size, MFT location, record size)
@@ -364,7 +376,7 @@ item above.
 ```
 src/core/        ImageSource, byte-reader helpers
 src/partition/   MBR + GPT scanning
-src/fs/          Filesystem interface, detector, ntfs/ hfs/ hfsplus/ apfs/
+src/fs/          Filesystem interface, detector, ntfs/ hfs/ hfsplus/ apfs/ exfat/
 src/fs/compression/  Apple decmpfs (zlib, LZVN) shared by HFS+ and APFS
 src/raid/        multi-drive assembly + geometry detection
 src/gui/         Qt5 main window + hex view
