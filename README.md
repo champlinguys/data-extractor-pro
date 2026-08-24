@@ -99,6 +99,29 @@ Status:
   synthetic volumes covering fragmented, nested, Unicode-named and deleted
   files.
 
+- **FAT32** - working: the filesystem every drive shipped with before exFAT
+  existed, and still what you find on cameras, car stereos, BIOS boot
+  partitions, and any external disk formatted once in the 2000s and never
+  touched since. Boot sector (with a fall back to the backup boot sector at
+  sector 6 when the primary is damaged), FAT chains, VFAT long names, CP437
+  short names with their NT lowercase hints, and the FSInfo free-space count.
+  **Deleted files are listed and recoverable**: deleting only overwrites the
+  first byte of the short name, so size and starting cluster survive, and the
+  long name is reassembled from the surrounding entries whenever its checksum
+  still vouches for them - which recovers `Wedding Photos 2004.jpg` rather than
+  `WEDDIN~1.JPG`. That lost first character is itself recovered by inverting
+  the long-name checksum, which is a bijection in exactly that byte. Because a
+  delete also frees the cluster chain, deleted files are read contiguously
+  instead of through a FAT that now describes whatever was written next.
+  Verified against The Sleuth Kit on a 320 GB customer drive: all 40,807 live
+  paths match, all 684 deleted entries TSK finds are found (plus 453 more,
+  recovered by descending into deleted directories, which TSK does not do), and
+  extracted files are byte-for-byte identical.
+
+  FAT12 and FAT16 are detected and labelled but not yet browsable - their root
+  directory is a fixed-size region rather than a cluster chain, and their FAT
+  entries are a different width.
+
 - **Apple transparent compression (decmpfs)** - working for both HFS+ and
   APFS: zlib and LZVN, stored in either the attribute or the resource fork.
   Without this a large share of the files on a Mac volume export as zero bytes.
@@ -266,7 +289,7 @@ filesystem parsers.
 +-----------------------------------------------------+
 | GUI (Qt5)              CLI (de-cli)                  |  front-ends
 +-----------------------------------------------------+
-| Filesystem: NTFS HFS HFS+ APFS exFAT [ext4]         |  fs/ - browse + read
+| Filesystem: NTFS HFS HFS+ APFS exFAT FAT32 [ext4]   |  fs/ - browse + read
 +-----------------------------------------------------+
 | Partition scan: MBR / GPT                           |  partition/
 +-----------------------------------------------------+
@@ -279,7 +302,7 @@ The pivot is **`ImageSource`** (`src/core/image_source.h`): a raw image, a
 single-partition window, the merged Optane volume, and a decrypt-on-read
 BitLocker volume are all just byte sources. The filesystem parsers only ever see
 "a volume of bytes," so Optane reconstruction, BitLocker decryption and RAID
-reassembly are each *a new `ImageSource`, not a change to NTFS/HFS+/APFS/exFAT*.
+reassembly are each *a new `ImageSource`, not a change to NTFS/HFS+/APFS/exFAT/FAT32*.
 
 ### What NTFS support does today (`src/fs/ntfs/`)
 - Boot-sector geometry (sector/cluster size, MFT location, record size)
@@ -376,7 +399,7 @@ item above.
 ```
 src/core/        ImageSource, byte-reader helpers
 src/partition/   MBR + GPT scanning
-src/fs/          Filesystem interface, detector, ntfs/ hfs/ hfsplus/ apfs/ exfat/
+src/fs/          Filesystem interface, detector, ntfs/ hfs/ hfsplus/ apfs/ exfat/ fat/
 src/fs/compression/  Apple decmpfs (zlib, LZVN) shared by HFS+ and APFS
 src/raid/        multi-drive assembly + geometry detection
 src/gui/         Qt5 main window + hex view
