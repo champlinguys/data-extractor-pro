@@ -1003,17 +1003,44 @@ QString sanitizeName(const QString& name) {
 
 // Worker-thread recursion: mirror a node to disk. Touches no Qt widgets; talks
 // to the UI only through the atomic counters and the mutex-guarded name.
-void MainWindow::exportWalk(Filesystem* fs, const FsNode& node, const QString& destDir) {
+void MainWindow::exportWalk(Filesystem* fs, const FsNode& node, const QString& destDir,
+                            std::vector<uint64_t>& ancestors, int depth) {
     if (exportCancel_.load()) return;
     QString safe = sanitizeName(QString::fromStdString(node.name));
     QString outPath = QDir(destDir).filePath(safe);
     if (node.isDir) {
+        // A damaged volume can hold a directory entry whose cluster points back
+        // at one of its own ancestors. Following it mirrors the same subtree
+        // over and over, one level deeper each lap, until the destination is
+        // full - so refuse to descend into a directory already open above us.
+        //
+        // The check is against the *current path*, not every directory visited:
+        // the same directory legitimately appearing under two different parents
+        // is not a loop, and must still be exported both times.
+        const uint64_t ident = fs->dirIdentity(node);
+        if (ident != 0 &&
+            std::find(ancestors.begin(), ancestors.end(), ident) != ancestors.end()) {
+            ++exportCycles_;
+            return;
+        }
+        // Backstop for what dirIdentity() cannot see: a cycle whose directories
+        // differ each lap, and filesystems that return 0 for "unknown".
+        if (depth >= de::kMaxWalkDepth) {
+            ++exportCycles_;
+            return;
+        }
+
         QDir().mkpath(outPath);
         de::applyInvokingOwner(outPath.toStdString());
+        if (ident != 0) ancestors.push_back(ident);
         for (const auto& c : fs->listDir(node)) {
-            exportWalk(fs, c, outPath);
-            if (exportCancel_.load()) return;
+            exportWalk(fs, c, outPath, ancestors, depth + 1);
+            if (exportCancel_.load()) {
+                if (ident != 0) ancestors.pop_back();
+                return;
+            }
         }
+        if (ident != 0) ancestors.pop_back();
         // After the children, not before: writing them bumps the directory's
         // own mtime, so stamping it first would be undone.
         if (exportKeepTimes_)
@@ -1140,7 +1167,7 @@ void MainWindow::exportSelected() {
     }
 
     exportCancel_ = false; exportDone_ = false; exportUserCancelled_ = false;
-    exportBytes_ = 0; exportFiles_ = 0; exportFails_ = 0;
+    exportBytes_ = 0; exportFiles_ = 0; exportFails_ = 0; exportCycles_ = 0;
     { std::lock_guard<std::mutex> lk(exportNameMutex_); exportName_.clear(); }
 
     QProgressDialog progress("Starting export...", "Cancel", 0, 0, this);
@@ -1157,7 +1184,9 @@ void MainWindow::exportSelected() {
     // Background worker: does all image I/O; never touches widgets.
     std::thread worker([this, jobs, destDir] {
         for (const auto& j : jobs) {
-            exportWalk(j.fs, j.node, destDir);
+            // Fresh chain per root: two checked roots are independent walks.
+            std::vector<uint64_t> ancestors;
+            exportWalk(j.fs, j.node, destDir, ancestors, 0);
             if (exportCancel_.load()) break;
         }
         exportDone_ = true;
@@ -1188,4 +1217,16 @@ void MainWindow::exportSelected() {
             .arg(humanSize(exportBytes_.load()))
             .arg(exportFails_.load() ? QString(", %1 failed").arg(exportFails_.load()) : QString())
             .arg(cancelled ? " (cancelled)" : ""));
+
+    // Worth saying out loud rather than burying: a loop means the source
+    // directory tree is damaged, and the export is correspondingly incomplete.
+    if (exportCycles_.load())
+        QMessageBox::warning(this, "Directory loop in the source",
+            QString("Stopped descending %1 time(s) because a folder pointed back "
+                    "into a folder that already contained it.\n\n"
+                    "That is damage in the source volume's directory tree, not a "
+                    "problem with the export. Everything reachable without going "
+                    "around the loop was exported; anything reachable *only* "
+                    "through it was not.")
+                .arg(exportCycles_.load()));
 }

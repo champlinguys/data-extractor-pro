@@ -721,6 +721,19 @@ std::vector<uint8_t> ExfatFilesystem::readFile(const FsNode& file) {
     return out;
 }
 
+uint64_t ExfatFilesystem::dirIdentity(const FsNode& dir) {
+    if (!dir.isDir) return 0;
+    // The root directory has no entry set of its own; its cluster is the one
+    // the boot sector names.
+    if (dir.id == 0) return rootCluster_;
+    auto rec = recordAt(dir.id);
+    if (!rec || !rec->isDir) return 0;
+    // An empty directory can legitimately have no cluster allocated. 0 is the
+    // "unknown" contract from the base class, and is right here too: a
+    // directory with no clusters has no children to recurse into anyway.
+    return rec->firstCluster;
+}
+
 FsTimes ExfatFilesystem::fileTimes(const FsNode& node) {
     if (node.id == 0) return node.times;
     if (auto rec = recordAt(node.id)) return rec->times;

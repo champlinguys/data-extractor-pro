@@ -86,7 +86,11 @@ private:
     // walking the filesystem (so lazily-unloaded children are included too).
     void collectExportRoots(QTreeWidgetItem* item, QList<QTreeWidgetItem*>& out);
     // Runs on the export worker thread - must not touch any Qt widgets.
-    void exportWalk(de::Filesystem* fs, const de::FsNode& node, const QString& destDir);
+    // `ancestors` holds dirIdentity() for every directory currently open on
+    // the recursion path, so a directory that points back into its own
+    // ancestry is caught instead of being mirrored forever.
+    void exportWalk(de::Filesystem* fs, const de::FsNode& node, const QString& destDir,
+                    std::vector<uint64_t>& ancestors, int depth);
 
     bool updatingChecks_ = false;  // reentrancy guard for check propagation
 
@@ -98,6 +102,7 @@ private:
     std::atomic<unsigned long long> exportBytes_{0};
     std::atomic<int> exportFiles_{0};
     std::atomic<int> exportFails_{0};
+    std::atomic<int> exportCycles_{0};  // directory loops refused
     std::mutex exportNameMutex_;
     std::string exportName_;                  // current file, for the label
     // Export options snapshotted on the UI thread before the worker starts, so

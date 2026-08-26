@@ -43,6 +43,9 @@ public:
     std::vector<uint8_t> readFile(const FsNode& file) override;
     bool readFileStream(const FsNode& file, const DataSink& sink) override;
     FsTimes fileTimes(const FsNode& node) override;
+    // exFAT node ids are directory-entry offsets, so a cycle shows up as
+    // distinct ids pointing at one cluster. Identity has to be the cluster.
+    uint64_t dirIdentity(const FsNode& dir) override;
 
     std::string volumeName() const { return volName_; }
 

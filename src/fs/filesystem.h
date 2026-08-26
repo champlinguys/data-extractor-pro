@@ -94,7 +94,33 @@ public:
     // May cost an extra read per file, so callers should use it per exported
     // object, not per browsed row.
     virtual FsTimes fileTimes(const FsNode& node) { return node.times; }
+
+    // A stable identity for a *directory's contents*, used by recursive walkers
+    // to break cycles. Two FsNodes that would list the same children must give
+    // the same value here, and unrelated directories must not collide.
+    //
+    // `id` alone is not good enough everywhere. On NTFS, HFS, HFS+ and APFS it
+    // is a real object number (MFT record, CNID, inode), so a directory that
+    // points back at one of its own ancestors comes back with a number the
+    // walker has already seen. On FAT and exFAT `id` is the byte offset of the
+    // *directory entry*, and a damaged volume can hold any number of distinct
+    // entries whose first cluster is the same directory - which is precisely
+    // what an on-disk cycle looks like there. Those two override this to
+    // return the first cluster instead.
+    //
+    // Returns 0 when there is no usable identity (an empty directory with no
+    // cluster allocated, a record that no longer parses). Callers must treat 0
+    // as "unknown" and fall back to their depth limit rather than assuming two
+    // unknowns are the same directory.
+    virtual uint64_t dirIdentity(const FsNode& dir) { return dir.id; }
 };
+
+// Upper bound on directory nesting for any recursive walk. Real filesystems do
+// not come close - Windows capped whole *paths* at 260 characters for decades -
+// so anything past this is a corrupt volume, not deep nesting. It is the
+// backstop for what dirIdentity() cannot see: a cycle whose directories
+// genuinely differ each time around, and any filesystem that returns 0.
+inline constexpr int kMaxWalkDepth = 128;
 
 // Sniff the volume and return a mounted Filesystem, or nullptr if unrecognised.
 std::unique_ptr<Filesystem> detectFilesystem(std::shared_ptr<ImageSource> vol);

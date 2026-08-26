@@ -26,6 +26,9 @@ struct Stats {
     uint64_t files = 0;
     uint64_t dirs = 0;
     uint64_t bytes = 0;
+    // Directory loops refused during the walk. Non-zero means the source
+    // directory tree is damaged and the report is necessarily incomplete.
+    uint64_t cycles = 0;
 };
 
 // One entry per object, flattened, with parent links. Walking a large volume

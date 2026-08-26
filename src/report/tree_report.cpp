@@ -1,5 +1,6 @@
 #include "report/tree_report.h"
 #include <algorithm>
+#include <vector>
 #include <cstdio>
 #include <ctime>
 #include <functional>
@@ -27,15 +28,25 @@ std::string isoDate(int64_t ns) {
 // Walk the tree depth-first, calling `visit(path, node, depth)`. Directories
 // are visited before their contents.
 void walk(Filesystem& fs, const FsNode& dir, const std::string& path, size_t depth,
-          const Options& opt, Stats& stats,
+          const Options& opt, Stats& stats, std::vector<uint64_t>& ancestors,
           const std::function<void(const std::string&, const FsNode&, size_t)>& visit) {
-    if (depth > opt.maxDepth) return;
+    if (depth > opt.maxDepth || depth >= static_cast<size_t>(de::kMaxWalkDepth)) return;
+    // A directory that points back into its own ancestry would otherwise be
+    // counted once per lap, inflating every number in the report until
+    // maxDepth cuts it off. Skip it and record that we did.
+    const uint64_t ident = fs.dirIdentity(dir);
+    if (ident != 0 &&
+        std::find(ancestors.begin(), ancestors.end(), ident) != ancestors.end()) {
+        ++stats.cycles;
+        return;
+    }
+    if (ident != 0) ancestors.push_back(ident);
     for (const auto& child : fs.listDir(dir)) {
         std::string childPath = path + "/" + child.name;
         if (child.isDir) {
             ++stats.dirs;
             visit(childPath, child, depth);
-            walk(fs, child, childPath, depth + 1, opt, stats, visit);
+            walk(fs, child, childPath, depth + 1, opt, stats, ancestors, visit);
         } else {
             ++stats.files;
             stats.bytes += child.size;
@@ -44,6 +55,7 @@ void walk(Filesystem& fs, const FsNode& dir, const std::string& path, size_t dep
         if (opt.progress && ((stats.files + stats.dirs) % 2000 == 0))
             opt.progress(stats.files, stats.dirs);
     }
+    if (ident != 0) ancestors.pop_back();
 }
 
 void jsonEscape(const std::string& in, std::ostream& out) {
@@ -72,7 +84,8 @@ std::vector<Entry> collectTree(Filesystem& fs, const FsNode& root, Stats& stats,
                                const Options& opt) {
     std::vector<Entry> entries;
     std::vector<int> stack; // index of the directory open at each depth
-    walk(fs, root, "", 0, opt, stats,
+    std::vector<uint64_t> ancestors;
+    walk(fs, root, "", 0, opt, stats, ancestors,
          [&](const std::string&, const FsNode& n, size_t depth) {
              if (stack.size() < depth + 1) stack.resize(depth + 1, -1);
              Entry e;
@@ -127,7 +140,8 @@ Stats findNames(Filesystem& fs, const FsNode& root,
     for (const auto& n : needles) lowered.push_back(lower(n));
 
     Stats stats;
-    walk(fs, root, "", 0, opt, stats,
+    std::vector<uint64_t> ancestors;
+    walk(fs, root, "", 0, opt, stats, ancestors,
          [&](const std::string& path, const FsNode& n, size_t) {
              std::string name = lower(n.name);
              for (const auto& needle : lowered)
