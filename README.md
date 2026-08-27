@@ -226,6 +226,29 @@ de-cli browse <qlc.img> <optane.img> <cacheHintSector> <recovery-key> [cat <recn
 `cacheHintSector` is the Intel Cache region start (skips a slow device scan);
 find it with `de-cli imsm <optane.img>` if unknown.
 
+## BitLocker workflow (CLI)
+
+```sh
+# browse, search and export the NTFS volume inside a BitLocker partition
+de-cli <image> ls      2         --recovery-key <48-digit password>
+de-cli <image> find    2 <word>  --recovery-key <48-digit password>
+de-cli <image> export  2 <recno> <outdir> --recovery-key <48-digit password>
+```
+The recovery password is the six-group, 48-digit form Windows prints when
+BitLocker is enabled. `--recovery-key` may appear anywhere on the command
+line, and every BitLocker partition it unlocks is then handled as ordinary
+NTFS.
+
+## Exporting from a damaged directory tree (CLI)
+
+When a volume's directory indexes are too damaged to walk, extract files
+straight from their MFT records instead. The list is one file per line,
+`<recno>`, a tab, then the path to write it to under `<outdir>`:
+
+```sh
+de-cli <image> export-list 2 list.tsv <outdir>
+```
+
 ## FileVault 2 (CoreStorage) workflow (CLI)
 
 ```sh
