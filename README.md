@@ -224,7 +224,17 @@ de-cli unlock <qlc.img> <optane.img> <cacheHintSector> <recovery-key> [offset]
 de-cli browse <qlc.img> <optane.img> <cacheHintSector> <recovery-key> [cat <recno>]
 ```
 `cacheHintSector` is the Intel Cache region start (skips a slow device scan);
-find it with `de-cli imsm <optane.img>` if unknown.
+find it with `de-cli imsm <optane.img>` if unknown. It is optional everywhere -
+without it the region is located by scanning.
+
+An Optane pair is also a source spec, so the ordinary browse/search/export
+commands work on the reconstructed disk without a BitLocker key:
+
+```sh
+de-cli optane:<qlc.img>,<optane.img>[,<cacheSector>] ls   3
+de-cli optane:<qlc.img>,<optane.img>[,<cacheSector>] find 3 invoice
+de-cli optane:<qlc.img>,<optane.img>[,<cacheSector>] export 3 <recno> <outdir>
+```
 
 ## BitLocker workflow (CLI)
 

@@ -59,7 +59,13 @@ static void usage() {
         "                       Any CoreStorage partition is decrypted with it, so\n"
         "                       ls/export/tree/find work on the volume inside.\n"
         "\n"
-        "<source> is an image file, a device (/dev/sdc), or a RAID set:\n"
+        "<source> is an image file, a device (/dev/sdc), an Optane set, or a RAID\n"
+        "set:\n"
+        "  optane:<qlc>,<optane>[,<cacheSector>]  reconstruct an Intel Optane\n"
+        "                                       (RST) pair into one disk. The\n"
+        "                                       cache sector is optional; without\n"
+        "                                       it the Intel Cache region is found\n"
+        "                                       by scanning, which is slower.\n"
         "  raid:auto:/dev/sdc,/dev/sdd          work the geometry out and verify it\n"
         "  raid:stripe:128k:/dev/sdc,/dev/sdd   RAID 0 with a known stripe size\n"
         "  raid:concat:/dev/sdc,/dev/sdd        spanned / JBOD\n"
@@ -103,10 +109,27 @@ static std::shared_ptr<ImageSource> openRaw(const std::string& path) {
     }
 }
 
-// Turn a source spec into one addressable disk. A plain path opens as-is; a
-// "raid:..." spec assembles the members, either from a geometry the user
-// states or by working it out and verifying it against the filesystems found.
+static std::shared_ptr<ImageSource> reconstruct(std::shared_ptr<ImageSource> qlc,
+                                                std::shared_ptr<ImageSource> opt,
+                                                uint64_t hint);
+
+// Turn a source spec into one addressable disk. A plain path opens as-is; an
+// "optane:..." spec reconstructs a QLC+Optane pair into the volume the RST
+// driver presented; a "raid:..." spec assembles the members, either from a
+// geometry the user states or by working it out and verifying it against the
+// filesystems found.
 static std::shared_ptr<ImageSource> openSource(const std::string& spec) {
+    if (spec.rfind("optane:", 0) == 0) {
+        auto parts = splitCommas(spec.substr(7));
+        if (parts.size() < 2) { usage(); return nullptr; }
+        auto qlc = openRaw(parts[0]);
+        auto opt = openRaw(parts[1]);
+        if (!qlc || !opt) return nullptr;
+        uint64_t hint = UINT64_MAX;
+        if (parts.size() >= 3 && !parts[2].empty())
+            hint = std::strtoull(parts[2].c_str(), nullptr, 10) * 512ull;
+        return reconstruct(qlc, opt, hint);
+    }
     if (spec.rfind("raid:", 0) != 0) return openRaw(spec);
 
     std::string rest = spec.substr(5);

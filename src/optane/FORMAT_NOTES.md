@@ -49,6 +49,41 @@ Two structures, interleaved and stored in **redundant 8 KiB-strided copies**:
 
 Device serial / volume name throughout: `<device-serial-redacted>`. RST version `17.0`.
 
+### 2a-0. Locating the region: the signature alone is NOT enough
+
+The Intel RST driver binary embeds the literal `Intel Raid ISM Cfg Sig. `
+(alongside `1.3.00` / `1.4.01` and its log format strings) in its own string
+table, and on a caching system that binary is itself cached onto the Optane.
+A plain byte scan for the signature therefore hits **the driver's string table
+first** - on the third unit analysed, at byte 1,543,002,896, some 6.2 GB before
+the real metadata at 7,785,807,872 - and happily parses message text as disks
+and volumes (`num_disks` 32, `num_raid_devs` 39, serials like
+`Disk::makePlaceholder`).
+
+That false hit is not merely cosmetic: `makeSpanMerge()` derives the span length
+from the region offset, so it truncated the linear span from 15,206,656 sectors
+to ~3.0 M and served the stale QLC for the rest - which on that unit made even
+the NTFS root directory unreadable.
+
+Two things separate the real block from the string table:
+
+1. **The mdadm checksum.** `sum of every u32 over mpb_size bytes, minus the
+   stored check_sum word at 0x20` must equal that word. It matched exactly on
+   the real super (`mpb_size` 428, `0xceed253a`) and cannot be satisfied by
+   incidental text.
+2. **The region anchor.** The real super is always `0x1E00` into a region that
+   opens with `Intel IMSM NV Cache Cfg. Sig.` on an 8 KiB-aligned boundary.
+
+`findImsm()` now scans that 8 KiB alignment for the NV-cache signature and
+accepts a candidate only once the checksum validates. Anchoring on alignment
+also makes the no-hint scan far cheaper than the old byte-by-byte pass.
+
+Corollary: **never accept an unvalidated span length.** If the cache region is
+not found, `makeSpanMerge()` declines rather than assuming the span runs to the
+end of the device - past the span the Optane holds cache metadata, so guessing
+long would serve ~20 GB of metadata as volume data and be strictly worse than
+the plain QLC.
+
 ### 2a. IMSM RAID super (`Intel Raid ISM Cfg Sig.`) - DOCUMENTED
 
 This is the same on-disk format Linux `mdadm` implements (`super-intel.c`,

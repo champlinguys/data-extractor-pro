@@ -25,10 +25,16 @@ std::shared_ptr<ImageSource> makeSpanMerge(std::shared_ptr<ImageSource> qlc,
     uint64_t spanStart = rd32(&vbr[0x1C]); // NTFS/BDE hidden sectors
 
     // Span length = start of the Intel Cache metadata region (end of the span
-    // component). Fall back to the whole Optane image if IMSM isn't found.
-    uint64_t spanLenSectors = optane->size() / 512;
-    if (auto md = parseImsm(*optane, cacheHintBytes))
-        spanLenSectors = md->cacheRegionOffset / 512;
+    // component). Without it we do not know where the linear copy stops, and
+    // guessing long is destructive: past the span the Optane holds cache
+    // metadata, so we would serve ~20 GB of metadata as volume data and make
+    // the reconstruction worse than the plain QLC. Decline instead.
+    auto md = parseImsm(*optane, cacheHintBytes);
+    if (!md)
+        return fail("found a linear span but no Intel Cache region, so its "
+                    "length is unknown - re-run with the Intel Cache partition "
+                    "start sector to use it");
+    uint64_t spanLenSectors = md->cacheRegionOffset / 512;
 
     auto map = std::make_shared<SpanCacheMap>(spanStart, spanLenSectors);
     return std::make_shared<OptaneMergeSource>(qlc, optane, map, qlc->size());
