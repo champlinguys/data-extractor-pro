@@ -23,6 +23,7 @@
 #include <string>
 #include <set>
 #include <vector>
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <filesystem>
@@ -38,6 +39,9 @@ static void usage() {
         "  de-cli <source> extract <part#> <recno> <out>   write one file\n"
         "  de-cli <source> export <part#> <recno> <outdir> recursively export a\n"
         "                                       folder, preserving dates\n"
+        "  de-cli <source> export-list <part#> <list.tsv> <outdir>  extract files by\n"
+        "                                       MFT record (<recno>TAB<relpath> per\n"
+        "                                       line), bypassing directory indexes\n"
         "  de-cli <source> find <part#> <word> [word...]   search every folder and\n"
         "                                       file name; prints full paths\n"
         "  de-cli <source> tree <part#> <out.txt> [out.html] [--dirs-only]\n"
@@ -47,6 +51,9 @@ static void usage() {
         "  de-cli <optane> imsm [hintSector]    parse Intel IMSM/RST metadata\n"
         "\n"
         "options (anywhere on the command line):\n"
+        "  --recovery-key <pw>  BitLocker recovery password, the 48-digit six-group\n"
+        "                       form. Any BitLocker partition is decrypted with it,\n"
+        "                       so ls/export/tree/find work on the volume inside.\n"
         "  --volume-key <hex>   CoreStorage/FileVault 2 volume key, 32 bytes for\n"
         "                       AES-XTS-128 (64 hex chars) or 64 for AES-XTS-256.\n"
         "                       Any CoreStorage partition is decrypted with it, so\n"
@@ -197,6 +204,46 @@ static void maybeUnlockCoreStorage(std::shared_ptr<ImageSource>& vol) {
     }
 }
 
+// BitLocker recovery password (the 48-digit, six-group form). Empty when the
+// caller did not pass --recovery-key.
+static std::string g_bdeKey;
+
+// True when this volume's boot sector carries BitLocker's "-FVE-FS-" signature.
+// Used only to tell "this partition is not encrypted" apart from "the key is
+// wrong", so the failure message can say which.
+static bool looksLikeBitLocker(ImageSource& vol) {
+    uint8_t boot[512] = {};
+    size_t n = vol.readAt(0, boot, sizeof boot);
+    return n >= 11 && std::memcmp(boot + 3, "-FVE-FS-", 8) == 0;
+}
+
+// If `vol` is a BitLocker volume and we hold a recovery password, swap in the
+// decrypted view so the rest of the tool sees an ordinary NTFS volume. This
+// mirrors maybeUnlockCoreStorage and is likewise safe to call on every
+// partition. Without it, ls/export/tree/find report "unrecognised filesystem"
+// on any encrypted volume -- the encrypted bytes are simply not a filesystem.
+static void maybeUnlockBitLocker(const std::shared_ptr<ImageSource>& parent,
+                                 uint64_t baseByte,
+                                 std::shared_ptr<ImageSource>& vol) {
+    if (g_bdeKey.empty() || !looksLikeBitLocker(*vol)) return;
+
+    // The partition table can describe a shorter volume than BitLocker itself
+    // does; reconcile before unlocking or the tail of the filesystem is lost.
+    std::string note;
+    vol = de::bitlocker::reconcileVolumeSize(parent, baseByte, vol, &note);
+    if (!note.empty()) std::fprintf(stderr, "BitLocker: %s\n", note.c_str());
+
+    if (auto dec = de::bitlocker::unlockVolume(vol, g_bdeKey)) {
+        std::fprintf(stderr, "BitLocker: unlocked (%.2f GB plaintext)\n",
+                     dec->size() / 1e9);
+        vol = dec;
+    } else {
+        std::fprintf(stderr,
+                     "BitLocker: could not unlock - the recovery key was "
+                     "rejected for this volume\n");
+    }
+}
+
 // Resolve a partition and mount its filesystem, or return nullptr with a message.
 static std::unique_ptr<Filesystem> mount(const std::shared_ptr<ImageSource>& img,
                                          int partNo, std::shared_ptr<ImageSource>& volOut) {
@@ -207,6 +254,7 @@ static std::unique_ptr<Filesystem> mount(const std::shared_ptr<ImageSource>& img
     }
     volOut = parts[partNo - 1].asSource(img);
     maybeUnlockCoreStorage(volOut);
+    maybeUnlockBitLocker(img, parts[partNo - 1].firstByte, volOut);
     auto fs = detectFilesystem(volOut);
     if (!fs) std::fprintf(stderr, "unrecognised filesystem on partition %d\n", partNo);
     return fs;
@@ -243,12 +291,26 @@ static std::string insertBeforeExt(const std::string& name, const std::string& s
 // the workflow that matters when the destination is smaller than the source:
 // pick one folder, take only that.
 static int exportTree(Filesystem& fs, const FsNode& start, const std::string& outRoot) {
-    uint64_t files = 0, bytes = 0, failed = 0;
-    std::function<void(const FsNode&, const std::string&)> rec =
-        [&](const FsNode& dir, const std::string& path) {
+    uint64_t files = 0, bytes = 0, failed = 0, cycles = 0;
+    // dirIdentity() of every directory open on the current path. A damaged
+    // volume can hold a directory entry whose cluster points back at one of its
+    // own ancestors; following it mirrors the same subtree once per lap, one
+    // level deeper each time, until the destination fills up.
+    std::vector<uint64_t> ancestors;
+    std::function<void(const FsNode&, const std::string&, int)> rec =
+        [&](const FsNode& dir, const std::string& path, int depth) {
+            // Checked against the current path only: the same directory
+            // legitimately reachable under two different parents is not a loop.
+            const uint64_t ident = fs.dirIdentity(dir);
+            if (ident != 0 && std::find(ancestors.begin(), ancestors.end(),
+                                        ident) != ancestors.end()) {
+                ++cycles; return;
+            }
+            if (depth >= de::kMaxWalkDepth) { ++cycles; return; }
             std::error_code ec;
             std::filesystem::create_directories(path, ec);
             de::applyInvokingOwner(path);
+            if (ident != 0) ancestors.push_back(ident);
             // Output paths already claimed in this directory.
             std::set<std::string> used;
             for (auto& c : fs.listDir(dir)) {
@@ -269,7 +331,7 @@ static int exportTree(Filesystem& fs, const FsNode& start, const std::string& ou
                     cp = path + "/" +
                          insertBeforeExt(safe, " (" + std::to_string(dup) + ")");
                 if (c.isDir) {
-                    rec(c, cp);
+                    rec(c, cp, depth + 1);
                     // After its contents, which would otherwise bump its mtime.
                     de::applyFileTimes(cp, fs.fileTimes(c));
                     continue;
@@ -306,13 +368,20 @@ static int exportTree(Filesystem& fs, const FsNode& start, const std::string& ou
                                  (unsigned long long)files, bytes / 1e9);
                 (void)before;
             }
+            if (ident != 0) ancestors.pop_back();
         };
-    rec(start, outRoot);
+    rec(start, outRoot, 0);
     std::fprintf(stderr, "\rexported %llu files, %.2f GB to %s\n",
                  (unsigned long long)files, bytes / 1e9, outRoot.c_str());
     if (failed)
         std::fprintf(stderr, "%llu file(s) could not be read in full\n",
                      (unsigned long long)failed);
+    if (cycles)
+        std::fprintf(stderr,
+                     "warning: refused to descend %llu directory loop(s); the "
+                     "source directory tree is damaged, and anything reachable "
+                     "only through a loop was not exported\n",
+                     (unsigned long long)cycles);
     return failed ? 1 : 0;
 }
 
@@ -323,6 +392,11 @@ int main(int argc, char** argv) {
     // below, so it can be written anywhere without disturbing argument order.
     std::vector<char*> args;
     for (int i = 0; i < argc; ++i) {
+        if (std::string(argv[i]) == "--recovery-key" && i + 1 < argc) {
+            g_bdeKey = argv[i + 1];
+            ++i;
+            continue;
+        }
         if (std::string(argv[i]) == "--volume-key" && i + 1 < argc) {
             g_csKey = de::corestorage::parseVolumeKey(argv[i + 1]);
             if (!g_csKey) {
@@ -516,18 +590,29 @@ int main(int argc, char** argv) {
             if (argc >= 9 && std::string(argv[6]) == "extract") {
                 uint64_t rootId = std::strtoull(argv[7], nullptr, 10);
                 std::string outRoot = argv[8];
-                int files = 0; uint64_t bytes = 0;
-                std::function<void(uint64_t, const std::string&)> rec =
-                    [&](uint64_t dirId, const std::string& path) {
+                int files = 0; uint64_t bytes = 0; int cycles = 0;
+                // dirIdentity() of every directory open on the current path, so
+                // a folder pointing back into its own ancestry is refused rather
+                // than mirrored until the destination fills up.
+                std::vector<uint64_t> ancestors;
+                std::function<void(uint64_t, const std::string&, int)> rec =
+                    [&](uint64_t dirId, const std::string& path, int depth) {
+                        de::FsNode d; d.id = dirId; d.isDir = true;
+                        const uint64_t ident = fs->dirIdentity(d);
+                        if (ident != 0 && std::find(ancestors.begin(), ancestors.end(),
+                                                    ident) != ancestors.end()) {
+                            ++cycles; return;
+                        }
+                        if (depth >= de::kMaxWalkDepth) { ++cycles; return; }
                         std::filesystem::create_directories(path);
                         de::applyInvokingOwner(path);
-                        de::FsNode d; d.id = dirId; d.isDir = true;
+                        if (ident != 0) ancestors.push_back(ident);
                         for (auto& c : fs->listDir(d)) {
                             std::string safe = c.name;
                             for (auto& ch : safe) if (ch == '/') ch = '_';
                             std::string cp = path + "/" + safe;
                             if (c.isDir) {
-                                rec(c.id, cp);
+                                rec(c.id, cp, depth + 1);
                                 // After its contents, which bump its mtime.
                                 de::applyFileTimes(cp, fs->fileTimes(c));
                             }
@@ -556,10 +641,16 @@ int main(int argc, char** argv) {
                                 de::applyInvokingOwner(cp);
                             }
                         }
+                        if (ident != 0) ancestors.pop_back();
                     };
-                rec(rootId, outRoot);
+                rec(rootId, outRoot, 0);
                 std::fprintf(stderr, "extracted %d files, %llu bytes to %s\n",
                              files, (unsigned long long)bytes, outRoot.c_str());
+                if (cycles)
+                    std::fprintf(stderr,
+                        "warning: refused to descend %d directory loop(s); the "
+                        "source directory tree is damaged and anything reachable "
+                        "only through the loop was not extracted\n", cycles);
                 return 0;
             }
             std::printf("Reconstructed + decrypted %s volume - root listing:\n",
@@ -704,6 +795,67 @@ int main(int argc, char** argv) {
         uint64_t id = std::strtoull(argv[4], nullptr, 10);
         if (id != start.id) { start.id = id; start.isDir = true; start.name.clear(); }
         return exportTree(*fs, start, argv[5]);
+    }
+
+    // Extract files by MFT record number, from a list, in one pass.
+    //
+    // Why this exists: `export` walks directory indexes, so a directory whose
+    // $INDEX_ALLOCATION was never imaged lists as empty and its files are
+    // silently skipped -- even when every one of their data runs is present.
+    // The MFT records survive independently, so a catalogue built from the MFT
+    // can still name those files. This takes <recno>TAB<relative/path> per line
+    // and writes each one, bypassing the index entirely. One process, one MFT
+    // parse, so it scales to tens of thousands of files.
+    if (cmd == "export-list") {
+        if (argc < 6) { usage(); return 2; }
+        auto fs = mount(img, std::atoi(argv[3]), vol);
+        if (!fs) return 1;
+        std::ifstream list(argv[4]);
+        if (!list) { std::fprintf(stderr, "cannot open list %s\n", argv[4]); return 1; }
+        std::string outRoot = argv[5];
+
+        uint64_t done = 0, failed = 0, bytes = 0;
+        std::string line;
+        while (std::getline(list, line)) {
+            if (line.empty()) continue;
+            size_t tab = line.find('\t');
+            if (tab == std::string::npos) continue;
+            uint64_t rec = std::strtoull(line.substr(0, tab).c_str(), nullptr, 10);
+            std::string rel = line.substr(tab + 1);
+            std::string outPath = outRoot + "/" + rel;
+
+            std::error_code ec;
+            std::filesystem::create_directories(
+                std::filesystem::path(outPath).parent_path(), ec);
+
+            FsNode f; f.id = rec; f.isDir = false;
+            std::ofstream os(outPath, std::ios::binary);
+            if (!os) { ++failed; continue; }
+            uint64_t got = 0;
+            bool ok = fs->readFileStream(f, [&](const uint8_t* d, size_t n) {
+                os.write(reinterpret_cast<const char*>(d),
+                         static_cast<std::streamsize>(n));
+                got += n; return static_cast<bool>(os);
+            });
+            os.close();
+            if (!ok || got == 0) {
+                // Nothing readable: leave no misleading empty file behind.
+                std::filesystem::remove(outPath, ec);
+                ++failed;
+            } else {
+                de::applyFileTimes(outPath, fs->fileTimes(f));
+                de::applyInvokingOwner(outPath);
+                bytes += got; ++done;
+            }
+            if (((done + failed) % 500) == 0)
+                std::fprintf(stderr, "\r  %llu written, %llu failed, %.2f GB",
+                             (unsigned long long)done, (unsigned long long)failed,
+                             bytes / 1e9);
+        }
+        std::fprintf(stderr, "\rexport-list: %llu written, %llu failed, %.2f GB to %s\n",
+                     (unsigned long long)done, (unsigned long long)failed,
+                     bytes / 1e9, outRoot.c_str());
+        return failed && !done ? 1 : 0;
     }
 
     if (cmd == "find") {
