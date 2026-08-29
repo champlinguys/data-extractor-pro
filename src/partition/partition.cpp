@@ -199,12 +199,96 @@ uint32_t detectSectorSize(const std::shared_ptr<ImageSource>& img,
     return 512;   // nothing corroborated; keep the historical default
 }
 
+// ------------------------------------------------------- Apple Partition Map
+//
+// The scheme every Mac used before the Intel transition, and the one every
+// external drive sold for a Mac in that era carries. Block 0 is a Driver
+// Descriptor Record signed 'ER' which states the device block size; blocks
+// 1..n are the map entries themselves, each signed 'PM' and each repeating how
+// many entries the map has.
+//
+// An APM disk carries no 0x55AA at the end of block 0, so a scanner that knows
+// only MBR and GPT reports "no partition table" on a perfectly healthy Mac
+// drive and falls back to treating the whole disk as one volume - which then
+// fails to mount, because the filesystem starts 393,216 bytes in.
+//
+// The map also lists far more entries than a user would call partitions: the
+// map is itself an entry, as are the legacy driver stubs and every unallocated
+// hole. A 2005 LaCie shows seven entries for one volume of data, so the
+// bookkeeping kinds are skipped and only real volumes are reported.
+constexpr uint16_t APM_DDR_SIGNATURE = 0x4552;    // 'ER', block 0
+constexpr uint16_t APM_ENTRY_SIGNATURE = 0x504D;  // 'PM', blocks 1..n
+constexpr uint32_t APM_MAX_ENTRIES = 256;         // sanity cap on pmMapBlkCnt
+
+// A fixed-width, NUL-padded APM name/type field.
+std::string apmString(const uint8_t* p, size_t max) {
+    size_t n = 0;
+    while (n < max && p[n]) ++n;
+    std::string out(reinterpret_cast<const char*>(p), n);
+    // These fields are ASCII by spec; keep anything unprintable from reaching
+    // a terminal or a Qt label.
+    for (char& c : out)
+        if (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) == 0x7F)
+            c = '_';
+    return out;
+}
+
+// Entries that describe bookkeeping rather than a volume.
+bool apmIsBookkeeping(const std::string& type) {
+    return type == "Apple_partition_map" || type == "Apple_Free" ||
+           type == "Apple_Void";
+}
+
+std::vector<Partition> scanApm(const std::shared_ptr<ImageSource>& img,
+                               const std::vector<uint8_t>& ddr) {
+    std::vector<Partition> out;
+    // Offsets are in units of the block size the DDR declares - 512 on every
+    // hard disk, 2048 on optical media - not in 512-byte sectors.
+    uint32_t blockSize = rdBE16(ddr.data() + 2);
+    if (blockSize < 512 || blockSize % 512) blockSize = 512;
+
+    auto first = img->read(blockSize, 512);
+    if (first.size() < 512 || rdBE16(first.data()) != APM_ENTRY_SIGNATURE) return out;
+    uint32_t count = rdBE32(first.data() + 4);
+    if (count > APM_MAX_ENTRIES) count = APM_MAX_ENTRIES;
+
+    int idx = 1;
+    for (uint32_t i = 0; i < count; ++i) {
+        auto entry = i == 0 ? first : img->read(static_cast<uint64_t>(i + 1) * blockSize, 512);
+        if (entry.size() < 128 || rdBE16(entry.data()) != APM_ENTRY_SIGNATURE) break;
+
+        uint64_t startBlock = rdBE32(entry.data() + 8);
+        uint64_t blocks = rdBE32(entry.data() + 12);
+        std::string name = apmString(entry.data() + 16, 32);
+        std::string type = apmString(entry.data() + 48, 32);
+        if (blocks == 0 || apmIsBookkeeping(type)) continue;
+
+        Partition p;
+        p.scheme = "APM";
+        p.firstByte = startBlock * blockSize;
+        p.lengthBytes = blocks * blockSize;
+        p.typeName = name.empty() ? type : type + " \"" + name + "\"";
+        p.index = idx++;
+        if (p.firstByte >= img->size()) continue;
+        out.push_back(std::move(p));
+    }
+    return out;
+}
+
 } // namespace
 
 std::vector<Partition> scanPartitions(const std::shared_ptr<ImageSource>& img) {
     std::vector<Partition> out;
 
     auto mbr = img->read(0, 512);
+
+    // The Apple Partition Map is checked first: its block 0 has no 0x55AA, so
+    // it has to be recognised before the MBR path below rejects it.
+    if (mbr.size() >= 512 && rdBE16(mbr.data()) == APM_DDR_SIGNATURE) {
+        out = scanApm(img, mbr);
+        if (!out.empty()) return out;
+    }
+
     // Derived from the table itself, never assumed. See detectSectorSize().
     const uint32_t sectorSize = detectSectorSize(img, mbr);
     bool hasSig = (mbr[510] == 0x55 && mbr[511] == 0xAA);

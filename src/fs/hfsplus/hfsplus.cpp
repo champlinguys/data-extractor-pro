@@ -1,5 +1,6 @@
 #include "fs/hfsplus/hfsplus.h"
 #include "core/byte_reader.h"
+#include "fs/hfs/hfs_wrapper.h"
 #include "fs/compression/decmpfs.h"
 #include <algorithm>
 #include <cstring>
@@ -265,11 +266,26 @@ bool HfsPlusFilesystem::probe(ImageSource& vol) {
     uint8_t vh[8];
     if (vol.readAt(VH_OFFSET, vh, sizeof vh) < sizeof vh) return false;
     uint16_t sig = rdBE16(vh);
-    return sig == SIG_HFSPLUS || sig == SIG_HFSX;
+    if (sig == SIG_HFSPLUS || sig == SIG_HFSX) return true;
+    // A Mac OS 8/9-compatible drive holds 'BD' here and the real volume header
+    // further in. That is still an HFS+ volume, and claiming otherwise hands
+    // the disk to the classic-HFS reader, which mounts the wrapper's handful
+    // of Apple files instead of the volume the customer cares about.
+    if (auto embedded = hfswrapper::find(vol)) {
+        if (vol.readAt(embedded->offset + VH_OFFSET, vh, sizeof vh) < sizeof vh)
+            return false;
+        uint16_t inner = rdBE16(vh);
+        return inner == SIG_HFSPLUS || inner == SIG_HFSX;
+    }
+    return false;
 }
 
 std::unique_ptr<HfsPlusFilesystem> HfsPlusFilesystem::open(std::shared_ptr<ImageSource> vol) {
     if (!vol) return nullptr;
+    // Unwrap first, so everything below - the volume header, the forks, the
+    // backup-header check, every allocation-block offset - is resolved against
+    // the embedded volume rather than the wrapper around it.
+    if (auto embedded = hfswrapper::open(vol)) vol = std::move(embedded);
     auto fs = std::unique_ptr<HfsPlusFilesystem>(new HfsPlusFilesystem());
     fs->vol_ = std::move(vol);
     if (!fs->mount()) return nullptr;
@@ -280,8 +296,8 @@ bool HfsPlusFilesystem::mount() {
     auto vh = vol_->read(VH_OFFSET, 512);
     uint16_t sig = rdBE16(vh.data());
     if (sig == SIG_HFS) {
-        // A classic-HFS volume here may be a wrapper around an embedded HFS+
-        // volume; the plain-HFS reader handles the un-wrapped case.
+        // A wrapper was already unwrapped in open(), so 'BD' here means a
+        // genuine classic-HFS volume: the plain-HFS reader's job, not ours.
         return false;
     }
     if (sig != SIG_HFSPLUS && sig != SIG_HFSX) return false;

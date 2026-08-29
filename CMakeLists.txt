@@ -24,6 +24,7 @@ add_library(de_engine STATIC
   src/fs/fs_detect.cpp
   src/fs/ntfs/ntfs.cpp
   src/fs/hfs/hfs.cpp
+  src/fs/hfs/hfs_wrapper.cpp
   src/fs/apfs/apfs_container.cpp
   src/fs/apfs/apfs.cpp
   src/fs/compression/decmpfs.cpp

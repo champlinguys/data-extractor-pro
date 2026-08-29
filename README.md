@@ -291,6 +291,8 @@ The tricky parsers are checked against filesystems and streams produced by
 themselves:
 
 ```sh
+tools/verify_apm_wrapper.sh # Apple Partition Map + the HFS wrapper that hides
+                           # an HFS+ volume inside a classic-HFS one
 tools/verify_hfsplus.sh    # HFS+: mkfs.hfsplus + the kernel driver create it,
                            # we read it back (needs sudo for the loop mount)
 tools/verify_raid.sh       # RAID: split a real disk image into members at a
@@ -324,7 +326,7 @@ filesystem parsers.
 +-----------------------------------------------------+
 | Filesystem: NTFS HFS HFS+ APFS exFAT FAT32 [ext4]   |  fs/ - browse + read
 +-----------------------------------------------------+
-| Partition scan: MBR / GPT                           |  partition/
+| Partition scan: MBR / GPT / APM                     |  partition/
 +-----------------------------------------------------+
 | ImageSource: Raw | SubImage | OptaneMerge |         |  core/ - the key seam
 |              BitLocker | RAID (stripe/concat/mirror) |
@@ -431,7 +433,7 @@ item above.
 ## Layout
 ```
 src/core/        ImageSource, byte-reader helpers
-src/partition/   MBR + GPT scanning
+src/partition/   MBR + GPT + Apple Partition Map scanning
 src/fs/          Filesystem interface, detector, ntfs/ hfs/ hfsplus/ apfs/ exfat/ fat/
 src/fs/compression/  Apple decmpfs (zlib, LZVN) shared by HFS+ and APFS
 src/raid/        multi-drive assembly + geometry detection

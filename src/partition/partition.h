@@ -13,7 +13,7 @@ struct Partition {
     uint64_t firstByte = 0;
     uint64_t lengthBytes = 0;
     std::string typeName;   // e.g. "NTFS / exFAT", "Linux filesystem", "EFI System"
-    std::string scheme;     // "MBR" or "GPT"
+    std::string scheme;     // "MBR", "GPT" or "APM"
     int index = 0;          // 1-based ordinal for display
 
     // Present this partition to a filesystem parser as a standalone source.

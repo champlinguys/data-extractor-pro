@@ -1,5 +1,6 @@
 #include "fs/hfs/hfs.h"
 #include "core/byte_reader.h"
+#include "fs/hfs/hfs_wrapper.h"
 #include <algorithm>
 #include <cstring>
 
@@ -98,7 +99,13 @@ std::string HfsFilesystem::macRomanToUtf8(const uint8_t* p, size_t len) {
 
 bool HfsFilesystem::probe(ImageSource& vol) {
     uint8_t sig[2];
-    return vol.readAt(2 * SECTOR, sig, 2) == 2 && sig[0] == 'B' && sig[1] == 'D';
+    if (vol.readAt(2 * SECTOR, sig, 2) != 2 || sig[0] != 'B' || sig[1] != 'D')
+        return false;
+    // 'BD' with an embedded HFS+ extent is a wrapper, not a volume anyone
+    // wants mounted: the files are in the HFS+ volume inside it. Declining
+    // here is what keeps the detector from stopping at the wrapper, whichever
+    // order it tries the two readers in.
+    return !hfswrapper::find(vol).has_value();
 }
 
 std::unique_ptr<HfsFilesystem> HfsFilesystem::open(std::shared_ptr<ImageSource> vol) {
