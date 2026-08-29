@@ -291,6 +291,8 @@ The tricky parsers are checked against filesystems and streams produced by
 themselves:
 
 ```sh
+tools/verify_btree_damage.sh # catalog B-tree: an overwritten leaf node must not
+                           # cost the rest of the tree
 tools/verify_apm_wrapper.sh # Apple Partition Map + the HFS wrapper that hides
                            # an HFS+ volume inside a classic-HFS one
 tools/verify_hfsplus.sh    # HFS+: mkfs.hfsplus + the kernel driver create it,

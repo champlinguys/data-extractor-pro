@@ -34,6 +34,7 @@ public:
     std::vector<uint8_t> readFile(const FsNode& file) override;
     bool readFileStream(const FsNode& file, const DataSink& sink) override;
     std::vector<uint8_t> readResourceFork(const FsNode& file) override;
+    bool statNode(const FsNode& in, FsNode& out) override;
     FsTimes fileTimes(const FsNode& node) override;
 
     std::string volumeName() const { return volName_; }
@@ -128,17 +129,54 @@ private:
         Cursor lowerBound(const Compare& cmp) const;
         bool ok() const { return ok_; }
 
+        // Every record whose key begins with the 4-byte `lead` (a parent CNID
+        // in the catalog, a CNID for a thread lookup), as raw record bytes.
+        //
+        // This is what the three catalog searches actually want, and unlike a
+        // cursor walk it can be completed from the nodes themselves when the
+        // leaf chain is broken. Returns records copied out of their nodes, so
+        // the caller is not holding pointers into a buffer that has moved on.
+        struct OwnedRec {
+            std::vector<uint8_t> key;
+            std::vector<uint8_t> val;
+            Rec view() const { return Rec{key.data(), key.size(), val.data(), val.size()}; }
+        };
+        std::vector<OwnedRec> group(uint32_t lead) const;
+
+        // How the last group() call was satisfied, for diagnostics.
+        bool sweptForLastGroup() const { return swept_; }
+
+        // Visit every record in every readable leaf node, in node order. Used
+        // to build indexes that the tree's own links cannot be trusted for.
+        void forEachRecord(const std::function<void(const Rec&)>& fn) const;
+
     private:
         std::vector<uint8_t> node(uint32_t nodeNo) const;
         static bool record(const std::vector<uint8_t>& node, uint16_t i,
                            uint16_t nodeSize, Rec& out);
+        // A readable leaf node, or empty: an index is not a leaf, and neither
+        // is an overwritten node claiming some other kind.
+        std::vector<uint8_t> leafNode(uint32_t nodeNo) const;
+        static void collectFrom(const std::vector<uint8_t>& node, uint16_t nodeSize,
+                                uint32_t lead, std::vector<OwnedRec>& out);
+        void buildNodeIndex() const;
+
+        // One entry per readable leaf node: the leading key field of its first
+        // and last record. A record with leading value V can only live in a
+        // node whose span covers V, so this replaces the leaf chain as the way
+        // to find a group.
+        struct NodeSpan { uint32_t node; uint32_t first; uint32_t last; };
 
         HfsPlusFilesystem* fs_ = nullptr;
         Fork fork_;
         uint32_t rootNode_ = 0;
         uint16_t nodeSize_ = 4096;
         uint32_t totalNodes_ = 0;
+        uint32_t firstLeaf_ = 0;
         bool ok_ = false;
+        mutable std::vector<NodeSpan> index_;
+        mutable bool indexBuilt_ = false;
+        mutable bool swept_ = false;
         friend class Cursor;
     };
 
@@ -154,6 +192,12 @@ private:
 
     // -- catalog --
     std::optional<Record> recordByCnid(uint32_t cnid);
+    // parent CNID -> CNIDs of folders that have a thread record. Folders whose
+    // own catalog record was lost to damage exist only here, and a lost folder
+    // takes its entire subtree out of the listing with it.
+    void buildFolderThreadIndex();
+    std::multimap<uint32_t, uint32_t> folderThreads_;
+    bool folderThreadsBuilt_ = false;
     std::optional<Record> childByName(uint32_t parent, const std::string& name);
     static bool parseCatalogRecord(const BTree::Rec& r, Record& out);
     // Follow an HFS+ hard link to the inode it points at.

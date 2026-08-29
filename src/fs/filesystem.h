@@ -86,6 +86,12 @@ public:
     // empty so existing filesystems (NTFS) need no changes; HFS overrides it.
     virtual std::vector<uint8_t> readResourceFork(const FsNode& /*file*/) { return {}; }
 
+    // Fill in name/size/isDir for a node the caller only has an `id` for, as
+    // when a list of record numbers is being exported without walking any
+    // directory. Returns false if the filesystem cannot resolve it - which is
+    // itself the answer to "did this file fail, or is it simply empty?".
+    virtual bool statNode(const FsNode& /*in*/, FsNode& /*out*/) { return false; }
+
     // Authoritative timestamps for a node, used by the export path so restored
     // files carry the dates they had on the original volume. The default hands
     // back what listDir already captured; NTFS overrides it to read

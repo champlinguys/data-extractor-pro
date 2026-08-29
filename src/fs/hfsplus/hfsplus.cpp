@@ -1,5 +1,7 @@
 #include "fs/hfsplus/hfsplus.h"
 #include "core/byte_reader.h"
+#include <map>
+#include <set>
 #include "fs/hfs/hfs_wrapper.h"
 #include "fs/compression/decmpfs.h"
 #include <algorithm>
@@ -168,6 +170,7 @@ bool HfsPlusFilesystem::BTree::init(HfsPlusFilesystem* fs, Fork fork, const char
     }
     const uint8_t* h = head.data() + 14; // BTHeaderRec follows the node descriptor
     rootNode_ = rdBE32(h + 2);
+    firstLeaf_ = rdBE32(h + 10);
     nodeSize_ = rdBE16(h + 18);
     totalNodes_ = rdBE32(h + 22);
     uint32_t attributes = rdBE32(h + 38);
@@ -180,8 +183,155 @@ bool HfsPlusFilesystem::BTree::init(HfsPlusFilesystem* fs, Fork fork, const char
         fs_->note(std::string(what) + " B-tree uses an unsupported key format");
         return false;
     }
+    // Never trust the header's node count past what the fork can address: on a
+    // partially recovered volume the fork is short, and a claimed count would
+    // send the node sweep reading off the end of it.
+    uint64_t addressable = fork_.logicalSize / nodeSize_;
+    if (!totalNodes_ || totalNodes_ > addressable)
+        totalNodes_ = static_cast<uint32_t>(addressable);
     ok_ = rootNode_ != 0 || totalNodes_ <= 1;
     return ok_;
+}
+
+std::vector<uint8_t> HfsPlusFilesystem::BTree::leafNode(uint32_t nodeNo) const {
+    if (nodeNo == 0 || (totalNodes_ && nodeNo >= totalNodes_)) return {};
+    auto blk = node(nodeNo);
+    if (blk.size() < nodeSize_) return {};
+    // An index node is not a leaf, and neither is an overwritten node claiming
+    // some kind that does not exist. Both must stop a chain rather than have
+    // their first four bytes followed as if they were a node pointer.
+    if (static_cast<int8_t>(blk[8]) != NODE_LEAF) return {};
+    return blk;
+}
+
+void HfsPlusFilesystem::BTree::collectFrom(const std::vector<uint8_t>& blk,
+                                           uint16_t nodeSize, uint32_t lead,
+                                           std::vector<OwnedRec>& out) {
+    uint16_t count = rdBE16(blk.data() + 10);
+    for (uint16_t i = 0; i < count; ++i) {
+        Rec r;
+        if (!record(blk, i, nodeSize, r)) continue;
+        if (r.keyLen < 4 || rdBE32(r.key) != lead) continue;
+        OwnedRec o;
+        o.key.assign(r.key, r.key + r.keyLen);
+        o.val.assign(r.val, r.val + r.valLen);
+        out.push_back(std::move(o));
+    }
+}
+
+// One pass over the fork, recording the span of leading key values in every
+// readable leaf node. Built at most once per tree, and only when a leaf chain
+// has actually broken - a healthy volume never pays for it.
+void HfsPlusFilesystem::BTree::buildNodeIndex() const {
+    if (indexBuilt_) return;
+    indexBuilt_ = true;
+    for (uint32_t n = 1; n < totalNodes_; ++n) {
+        auto blk = leafNode(n);
+        if (blk.empty()) continue;
+        uint16_t count = rdBE16(blk.data() + 10);
+        if (count == 0) continue;
+        Rec first, last;
+        if (!record(blk, 0, nodeSize_, first) || first.keyLen < 4) continue;
+        if (!record(blk, static_cast<uint16_t>(count - 1), nodeSize_, last) ||
+            last.keyLen < 4) continue;
+        index_.push_back({n, rdBE32(first.key), rdBE32(last.key)});
+    }
+    // Only worth telling the user about when the chain really is missing
+    // something: on a healthy volume the index simply confirms it.
+    uint32_t chained = 0;
+    for (uint32_t n = firstLeaf_, guard = 0;
+         n && guard < totalNodes_ + 1; ++guard) {
+        auto blk = leafNode(n);
+        if (blk.empty()) break;
+        ++chained;
+        uint32_t next = rdBE32(blk.data());
+        if (next == n) break;
+        n = next;
+    }
+    if (fs_ && chained < index_.size())
+        fs_->note("the catalog's leaf chain reaches only " + std::to_string(chained) +
+                  " of " + std::to_string(index_.size()) + " readable leaf nodes; "
+                  "the rest were indexed directly so the records in them are "
+                  "still found");
+}
+
+void HfsPlusFilesystem::BTree::forEachRecord(
+        const std::function<void(const Rec&)>& fn) const {
+    if (!ok_) return;
+    for (uint32_t n = 1; n < totalNodes_; ++n) {
+        auto blk = leafNode(n);
+        if (blk.empty()) continue;
+        uint16_t count = rdBE16(blk.data() + 10);
+        for (uint16_t i = 0; i < count; ++i) {
+            Rec r;
+            if (record(blk, i, nodeSize_, r)) fn(r);
+        }
+    }
+}
+
+std::vector<HfsPlusFilesystem::BTree::OwnedRec>
+HfsPlusFilesystem::BTree::group(uint32_t lead) const {
+    std::vector<OwnedRec> out;
+    swept_ = false;
+    if (!ok_) return out;
+
+    // The fast path: descend to the group's first leaf and follow the chain.
+    auto cur = lowerBound([lead](const uint8_t* k, size_t kl) -> int {
+        if (kl < 4) return -1;
+        return rdBE32(k) < lead ? -1 : 1;
+    });
+
+    bool complete = false;
+    std::vector<uint32_t> visited;
+    uint32_t nodeNo = cur.valid() ? cur.nodeNo_ : 0;
+    while (nodeNo) {
+        auto blk = leafNode(nodeNo);
+        if (blk.empty()) break;                 // damage: the chain ends here
+        visited.push_back(nodeNo);
+        collectFrom(blk, nodeSize_, lead, out);
+        Rec last;
+        uint16_t count = rdBE16(blk.data() + 10);
+        // If this node holds a key past the group, the group ended inside it
+        // and the chain never needed to go further.
+        if (count && record(blk, static_cast<uint16_t>(count - 1), nodeSize_, last) &&
+            last.keyLen >= 4 && rdBE32(last.key) > lead) { complete = true; break; }
+        uint32_t next = rdBE32(blk.data());
+        if (next == 0) { complete = true; break; }   // end of the tree
+        if (next == nodeNo) break;
+        nodeNo = next;
+    }
+    (void)complete;
+
+    // The chain only ever visits nodes it can still reach. On a damaged volume
+    // records for one parent also sit in nodes that fell out of the chain, and
+    // those are real entries - whole subtrees of the customer's data hang off
+    // them. So the node index is consulted as well, and anything the chain did
+    // not already produce is added.
+    //
+    // Building it costs one pass over the catalog fork, once per mount. That is
+    // a real cost on a large healthy volume, and it buys the guarantee that a
+    // directory listing is not quietly missing half its entries - the right
+    // trade for a tool whose job is damaged disks.
+    buildNodeIndex();
+    std::set<std::string> seen;
+    for (const auto& o : out)
+        seen.insert(std::string(o.key.begin(), o.key.end()) +
+                    std::string(o.val.begin(), o.val.end()));
+    for (const auto& span : index_) {
+        if (lead < span.first || lead > span.last) continue;
+        if (std::find(visited.begin(), visited.end(), span.node) != visited.end())
+            continue;
+        auto blk = leafNode(span.node);
+        if (blk.empty()) continue;
+        std::vector<OwnedRec> extra;
+        collectFrom(blk, nodeSize_, lead, extra);
+        for (auto& e : extra) {
+            auto id = std::string(e.key.begin(), e.key.end()) +
+                      std::string(e.val.begin(), e.val.end());
+            if (seen.insert(id).second) { swept_ = true; out.push_back(std::move(e)); }
+        }
+    }
+    return out;
 }
 
 HfsPlusFilesystem::BTree::Cursor
@@ -552,14 +702,8 @@ bool HfsPlusFilesystem::parseCatalogRecord(const BTree::Rec& r, Record& out) {
 std::vector<FsNode> HfsPlusFilesystem::listDir(const FsNode& dir) {
     std::vector<FsNode> out;
     const uint32_t parent = static_cast<uint32_t>(dir.id ? dir.id : CNID_ROOT);
-    auto cur = catalog_.lowerBound([parent](const uint8_t* k, size_t kl) -> int {
-        if (kl < 4) return -1;
-        uint32_t p = rdBE32(k);
-        return p < parent ? -1 : 1;
-    });
-    for (; cur.valid(); cur.next()) {
-        const auto& r = cur.rec();
-        if (r.keyLen < 4 || rdBE32(r.key) != parent) break;
+    for (const auto& owned : catalog_.group(parent)) {
+        const BTree::Rec r = owned.view();
         if (r.valLen >= 2) {
             uint16_t type = rdBE16(r.val);
             if (type == REC_FOLDER_THREAD || type == REC_FILE_THREAD) continue;
@@ -599,7 +743,56 @@ std::vector<FsNode> HfsPlusFilesystem::listDir(const FsNode& dir) {
         }
         out.push_back(std::move(n));
     }
+
+    // Folders whose own record was lost to damage appear only as thread
+    // records, so they are absent from the group scan above - and with them
+    // goes every file and folder beneath them. Add any that name this
+    // directory as their parent and were not already listed.
+    buildFolderThreadIndex();
+    if (!folderThreads_.empty()) {
+        std::set<uint64_t> already;
+        for (const auto& n : out) already.insert(n.id);
+        auto range = folderThreads_.equal_range(parent);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second == parent || already.count(it->second)) continue;
+            auto rec = recordByCnid(it->second);
+            if (!rec || !rec->isDir) continue;
+            FsNode n;
+            n.id = rec->cnid;
+            n.name = displayName(rec->name);
+            n.isDir = true;
+            n.times = rec->times;
+            out.push_back(std::move(n));
+        }
+    }
+
     return out;
+}
+
+// HFS+ records the parent/name link twice: in the object's own catalog record,
+// and in a thread record keyed by its CNID. The two sit in different parts of
+// the tree, so damage that takes one usually leaves the other. Folders are what
+// matter here - a folder whose record is gone never appears in its parent's
+// listing, and everything beneath it disappears from the walk with it.
+void HfsPlusFilesystem::buildFolderThreadIndex() {
+    if (folderThreadsBuilt_) return;
+    folderThreadsBuilt_ = true;
+    catalog_.forEachRecord([&](const BTree::Rec& r) {
+        if (r.keyLen < 4 || r.valLen < 10) return;
+        if (rdBE16(r.val) != REC_FOLDER_THREAD) return;
+        folderThreads_.emplace(rdBE32(r.val + 4), rdBE32(r.key));
+    });
+}
+
+bool HfsPlusFilesystem::statNode(const FsNode& in, FsNode& out) {
+    auto rec = recordByCnid(static_cast<uint32_t>(in.id));
+    if (!rec) return false;
+    out = in;
+    out.name = displayName(rec->name);
+    out.isDir = rec->isDir;
+    out.size = rec->isDir ? 0 : rec->data.logicalSize;
+    out.times = rec->times;
+    return true;
 }
 
 std::optional<HfsPlusFilesystem::Record> HfsPlusFilesystem::recordByCnid(uint32_t cnid) {
@@ -610,16 +803,17 @@ std::optional<HfsPlusFilesystem::Record> HfsPlusFilesystem::recordByCnid(uint32_
     }
     // Not seen yet: the thread record keyed by (cnid, empty name) names the
     // object's parent, and its siblings are then a group scan away.
-    auto cur = catalog_.lowerBound([cnid](const uint8_t* k, size_t kl) -> int {
-        if (kl < 4) return -1;
-        uint32_t p = rdBE32(k);
-        return p < cnid ? -1 : 1;
-    });
-    if (!cur.valid()) return std::nullopt;
-    const auto& r = cur.rec();
-    if (r.keyLen < 4 || rdBE32(r.key) != cnid || r.valLen < 8) return std::nullopt;
-    uint16_t type = rdBE16(r.val);
-    if (type != REC_FOLDER_THREAD && type != REC_FILE_THREAD) return std::nullopt;
+    auto recs = catalog_.group(cnid);
+    const BTree::Rec* thread = nullptr;
+    BTree::Rec view;
+    for (const auto& owned : recs) {
+        view = owned.view();
+        if (view.valLen < 8) continue;
+        uint16_t t = rdBE16(view.val);
+        if (t == REC_FOLDER_THREAD || t == REC_FILE_THREAD) { thread = &view; break; }
+    }
+    if (!thread) return std::nullopt;
+    const BTree::Rec& r = *thread;
 
     uint32_t parent = rdBE32(r.val + 4);
     if (r.valLen < 10) return std::nullopt;
@@ -633,19 +827,23 @@ std::optional<HfsPlusFilesystem::Record> HfsPlusFilesystem::recordByCnid(uint32_
         root.name = name;
         return root;
     }
-    return childByName(parent, name);
+    if (auto full = childByName(parent, name)) return full;
+    // No catalog record for it, but the thread proves it existed and names it.
+    // Only folders are worth resurrecting: a file without its record has no
+    // extents, so there is nothing to read back.
+    if (rdBE16(r.val) != REC_FOLDER_THREAD) return std::nullopt;
+    Record rec;
+    rec.cnid = cnid;
+    rec.parentId = parent;
+    rec.name = name;
+    rec.isDir = true;
+    return rec;
 }
 
 std::optional<HfsPlusFilesystem::Record>
 HfsPlusFilesystem::childByName(uint32_t parent, const std::string& name) {
-    auto cur = catalog_.lowerBound([parent](const uint8_t* k, size_t kl) -> int {
-        if (kl < 4) return -1;
-        uint32_t p = rdBE32(k);
-        return p < parent ? -1 : 1;
-    });
-    for (; cur.valid(); cur.next()) {
-        const auto& r = cur.rec();
-        if (r.keyLen < 4 || rdBE32(r.key) != parent) break;
+    for (const auto& owned : catalog_.group(parent)) {
+        const BTree::Rec r = owned.view();
         Record rec;
         if (!parseCatalogRecord(r, rec)) continue;
         if (rec.name != name) continue;

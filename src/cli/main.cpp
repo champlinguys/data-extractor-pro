@@ -41,7 +41,10 @@ static void usage() {
         "                                       folder, preserving dates\n"
         "  de-cli <source> export-list <part#> <list.tsv> <outdir>  extract files by\n"
         "                                       MFT record (<recno>TAB<relpath> per\n"
-        "                                       line), bypassing directory indexes\n"
+        "                                       line), bypassing directory indexes.\n"
+        "                                       --resource-forks also writes each\n"
+        "                                       file's resource fork as an\n"
+        "                                       AppleDouble \"._name\" sidecar\n"
         "  de-cli <source> find <part#> <word> [word...]   search every folder and\n"
         "                                       file name; prints full paths\n"
         "  de-cli <source> tree <part#> <out.txt> [out.html] [--dirs-only]\n"
@@ -73,6 +76,33 @@ static void usage() {
         "\n"
         "  de-cli raid <dev> <dev> [...]        analyse a set and show the\n"
         "                                       geometries that fit, best first\n");
+}
+
+// Write a file's resource fork beside it as an AppleDouble sidecar ("._name"),
+// the form macOS itself uses when copying a Mac file onto a foreign filesystem.
+// A classic Mac document can keep most of what matters in the resource fork, so
+// dropping it silently loses content that the data fork alone does not carry.
+static bool writeAppleDouble(const std::string& dataPath,
+                             const std::vector<uint8_t>& rsrc) {
+    std::filesystem::path p(dataPath);
+    std::filesystem::path side = p.parent_path() / ("._" + p.filename().string());
+    std::ofstream os(side, std::ios::binary);
+    if (!os) return false;
+    auto be32 = [&](uint32_t v) {
+        uint8_t b[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
+        os.write(reinterpret_cast<const char*>(b), 4);
+    };
+    be32(0x00051607);            // AppleDouble magic
+    be32(0x00020000);            // version 2
+    for (int i = 0; i < 16; ++i) os.put(0);   // filler
+    uint8_t n[2] = {0, 1};       // one entry
+    os.write(reinterpret_cast<const char*>(n), 2);
+    be32(2);                     // entry id 2 = resource fork
+    be32(38);                    // offset: 26-byte header + one 12-byte entry
+    be32(static_cast<uint32_t>(rsrc.size()));
+    os.write(reinterpret_cast<const char*>(rsrc.data()),
+             static_cast<std::streamsize>(rsrc.size()));
+    return static_cast<bool>(os);
 }
 
 // Split "a,b,c" into its parts.
@@ -837,7 +867,12 @@ int main(int argc, char** argv) {
         if (!list) { std::fprintf(stderr, "cannot open list %s\n", argv[4]); return 1; }
         std::string outRoot = argv[5];
 
-        uint64_t done = 0, failed = 0, bytes = 0;
+        uint64_t done = 0, failed = 0, bytes = 0, partial = 0, rsrcWritten = 0;
+        // Resource forks are Mac-only and most exports do not want them, but
+        // for a classic Mac volume they can be where the content actually is.
+        bool wantRsrc = false;
+        for (int i = 2; i < argc; ++i)
+            if (std::string(argv[i]) == "--resource-forks") wantRsrc = true;
         std::string line;
         while (std::getline(list, line)) {
             if (line.empty()) continue;
@@ -852,6 +887,12 @@ int main(int argc, char** argv) {
                 std::filesystem::path(outPath).parent_path(), ec);
 
             FsNode f; f.id = rec; f.isDir = false;
+            // Ask the filesystem how big the file is supposed to be. Without
+            // that, "read 0 bytes" and "this file is legitimately empty" look
+            // identical, and a short read looks like a complete one - so an
+            // export could report success over truncated or missing files.
+            FsNode info;
+            bool known = fs->statNode(f, info);
             std::ofstream os(outPath, std::ios::binary);
             if (!os) { ++failed; continue; }
             uint64_t got = 0;
@@ -861,7 +902,7 @@ int main(int argc, char** argv) {
                 got += n; return static_cast<bool>(os);
             });
             os.close();
-            if (!ok || got == 0) {
+            if (!ok || (got == 0 && !(known && info.size == 0))) {
                 // Nothing readable: leave no misleading empty file behind.
                 std::filesystem::remove(outPath, ec);
                 ++failed;
@@ -869,15 +910,33 @@ int main(int argc, char** argv) {
                 de::applyFileTimes(outPath, fs->fileTimes(f));
                 de::applyInvokingOwner(outPath);
                 bytes += got; ++done;
+                if (known && got < info.size) {
+                    ++partial;
+                    std::fprintf(stderr, "\r  PARTIAL %llu of %llu bytes: %s\n",
+                                 (unsigned long long)got,
+                                 (unsigned long long)info.size, rel.c_str());
+                }
+                if (wantRsrc) {
+                    auto rf = fs->readResourceFork(f);
+                    if (!rf.empty() && writeAppleDouble(outPath, rf)) ++rsrcWritten;
+                }
             }
             if (((done + failed) % 500) == 0)
                 std::fprintf(stderr, "\r  %llu written, %llu failed, %.2f GB",
                              (unsigned long long)done, (unsigned long long)failed,
                              bytes / 1e9);
         }
-        std::fprintf(stderr, "\rexport-list: %llu written, %llu failed, %.2f GB to %s\n",
+        std::fprintf(stderr,
+                     "\rexport-list: %llu written, %llu failed, %llu truncated, "
+                     "%llu resource fork(s), %.2f GB to %s\n",
                      (unsigned long long)done, (unsigned long long)failed,
+                     (unsigned long long)partial, (unsigned long long)rsrcWritten,
                      bytes / 1e9, outRoot.c_str());
+        if (partial)
+            std::fprintf(stderr,
+                         "  %llu file(s) came back shorter than the catalog says "
+                         "they are; those are incomplete, not recovered.\n",
+                         (unsigned long long)partial);
         return failed && !done ? 1 : 0;
     }
 
