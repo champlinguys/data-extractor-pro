@@ -17,6 +17,11 @@ enum class Level {
 
 const char* levelName(Level l);
 
+// A stripe size as people write it: "512 B", "32 KiB", "1 MiB". Plain division
+// by 1024 turns the sub-kilobyte stripes some hardware bridges use into a
+// meaningless "0 KiB", which is exactly when the number matters most.
+std::string stripeSizeName(uint64_t bytes);
+
 // One member of the set. `offset` skips any metadata the RAID implementation
 // keeps at the front of the disk; `length` bounds the data area (0 = to the
 // end of the device).

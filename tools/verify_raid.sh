@@ -129,7 +129,10 @@ sys.exit(1 if fails else 0)
 PY
 }
 
-for STRIPE in 32768 65536 131072 524288; do
+# 512 is the single-sector stripe some hardware bridges use (a G-RAID pair was
+# found doing it). It splits even the boot region across both drives, so it is
+# the case most likely to defeat detection - keep it in the regression set.
+for STRIPE in 512 32768 65536 131072 524288; do
   python3 - "$DISK" "$WORK" "$STRIPE" <<'PY'
 import sys
 disk, work, stripe = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -139,7 +142,8 @@ for i in range(0, len(data), stripe):
     members[(i // stripe) % 2].write(data[i:i + stripe])
 for m in members: m.close()
 PY
-  check_set "RAID 0, $((STRIPE / 1024)) KiB stripe (detector is not told)" "RAID 0"
+  if [ "$STRIPE" -ge 1024 ]; then LBL="$((STRIPE / 1024)) KiB"; else LBL="$STRIPE B"; fi
+  check_set "RAID 0, $LBL stripe (detector is not told)" "RAID 0"
 done
 
 python3 - "$DISK" "$WORK" <<'PY'

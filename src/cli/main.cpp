@@ -496,7 +496,14 @@ int main(int argc, char** argv) {
             std::string spec = "raid:";
             switch (r.layout.level) {
                 case de::raid::Level::Stripe:
-                    spec += "stripe:" + std::to_string(r.layout.stripeBytes / 1024) + "k:";
+                    // Whole kibibytes get the "k" suffix for readability; a
+                    // sub-kibibyte stripe (hardware bridges do use them) has to
+                    // be spelled out in bytes, or the suffix form would round it
+                    // to a "0k" that parses back as an unusable zero.
+                    if (r.layout.stripeBytes >= 1024 && r.layout.stripeBytes % 1024 == 0)
+                        spec += "stripe:" + std::to_string(r.layout.stripeBytes / 1024) + "k:";
+                    else
+                        spec += "stripe:" + std::to_string(r.layout.stripeBytes) + ":";
                     break;
                 case de::raid::Level::Concat: spec += "concat:"; break;
                 case de::raid::Level::Mirror: spec += "mirror:"; break;

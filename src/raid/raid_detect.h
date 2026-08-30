@@ -58,8 +58,14 @@ struct Candidate {
 struct DetectOptions {
     // Stripe sizes to try, smallest first. Apple's software RAID defaults to
     // 32 KiB, SoftRAID to 128 KiB; the rest are what people pick by hand.
-    std::vector<uint64_t> stripeSizes{4096,    8192,    16384,   32768,  65536,
-                                      131072,  262144,  524288,  1048576, 2097152};
+    // The sub-4 KiB sizes are not hand-picked by anyone - they come from
+    // hardware bridge chips. A G-RAID pair (Oxford Semiconductor bridge) was
+    // found striping at a single 512-byte sector, which splits even the boot
+    // region across both disks and so defeats every check that only looks at
+    // one member. Starting the search at 4 KiB made that set undetectable.
+    std::vector<uint64_t> stripeSizes{512,     1024,    2048,    4096,   8192,
+                                      16384,   32768,   65536,   131072, 262144,
+                                      524288,  1048576, 2097152};
     // How many cheap-pass candidates get the expensive filesystem check.
     size_t deepCandidates = 8;
     // Cap on member orderings tried, so a big set cannot explode.

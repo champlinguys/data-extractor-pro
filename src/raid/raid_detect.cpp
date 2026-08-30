@@ -641,7 +641,7 @@ DetectResult detect(const std::vector<std::shared_ptr<ImageSource>>& devices,
         if (!md.format.empty()) {
             std::string line = d->name() + ": " + md.format + " member";
             if (!md.levelName.empty()) line += ", level " + md.levelName;
-            if (md.chunkSize) line += ", chunk " + std::to_string(md.chunkSize / 1024) + " KiB";
+            if (md.chunkSize) line += ", chunk " + stripeSizeName(md.chunkSize);
             if (md.memberIndex >= 0)
                 line += ", member " + std::to_string(md.memberIndex + 1);
             if (md.memberCount > 0) line += " of " + std::to_string(md.memberCount);

@@ -1,5 +1,6 @@
 #include "raid/raid.h"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace de::raid {
@@ -11,6 +12,20 @@ const char* levelName(Level l) {
         case Level::Mirror: return "RAID 1 (mirrored)";
     }
     return "unknown";
+}
+
+std::string stripeSizeName(uint64_t bytes) {
+    char buf[64];
+    if (bytes >= (1ull << 20) && bytes % (1ull << 20) == 0)
+        std::snprintf(buf, sizeof buf, "%llu MiB",
+                      static_cast<unsigned long long>(bytes >> 20));
+    else if (bytes >= (1ull << 10) && bytes % (1ull << 10) == 0)
+        std::snprintf(buf, sizeof buf, "%llu KiB",
+                      static_cast<unsigned long long>(bytes >> 10));
+    else
+        std::snprintf(buf, sizeof buf, "%llu B",
+                      static_cast<unsigned long long>(bytes));
+    return buf;
 }
 
 namespace {
@@ -65,7 +80,7 @@ std::string Layout::describe() const {
     s += ", " + std::to_string(members.size()) + " member";
     if (members.size() != 1) s += "s";
     if (level == Level::Stripe)
-        s += ", " + std::to_string(stripeBytes / 1024) + " KiB stripe";
+        s += ", " + stripeSizeName(stripeBytes) + " stripe";
     s += ", " + humanSize(logicalSize()) + " logical";
     if (!origin.empty()) s += " [" + origin + "]";
     return s;
