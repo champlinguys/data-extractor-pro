@@ -13,6 +13,7 @@
 #include "bitlocker/volume.h"
 #include "corestorage/cs.h"
 #include "corestorage/source.h"
+#include "core/apple_double.h"
 #include "raid/raid.h"
 #include "raid/raid_detect.h"
 #include "report/tree_report.h"
@@ -76,33 +77,6 @@ static void usage() {
         "\n"
         "  de-cli raid <dev> <dev> [...]        analyse a set and show the\n"
         "                                       geometries that fit, best first\n");
-}
-
-// Write a file's resource fork beside it as an AppleDouble sidecar ("._name"),
-// the form macOS itself uses when copying a Mac file onto a foreign filesystem.
-// A classic Mac document can keep most of what matters in the resource fork, so
-// dropping it silently loses content that the data fork alone does not carry.
-static bool writeAppleDouble(const std::string& dataPath,
-                             const std::vector<uint8_t>& rsrc) {
-    std::filesystem::path p(dataPath);
-    std::filesystem::path side = p.parent_path() / ("._" + p.filename().string());
-    std::ofstream os(side, std::ios::binary);
-    if (!os) return false;
-    auto be32 = [&](uint32_t v) {
-        uint8_t b[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
-        os.write(reinterpret_cast<const char*>(b), 4);
-    };
-    be32(0x00051607);            // AppleDouble magic
-    be32(0x00020000);            // version 2
-    for (int i = 0; i < 16; ++i) os.put(0);   // filler
-    uint8_t n[2] = {0, 1};       // one entry
-    os.write(reinterpret_cast<const char*>(n), 2);
-    be32(2);                     // entry id 2 = resource fork
-    be32(38);                    // offset: 26-byte header + one 12-byte entry
-    be32(static_cast<uint32_t>(rsrc.size()));
-    os.write(reinterpret_cast<const char*>(rsrc.data()),
-             static_cast<std::streamsize>(rsrc.size()));
-    return static_cast<bool>(os);
 }
 
 // Split "a,b,c" into its parts.
@@ -406,13 +380,12 @@ static int exportTree(Filesystem& fs, const FsNode& start, const std::string& ou
                 ++files;
                 de::FsTimes t = fs.fileTimes(c);
                 if (auto rsrc = fs.readResourceFork(c); !rsrc.empty()) {
-                    std::ofstream rs(cp + ".rsrc", std::ios::binary);
-                    rs.write(reinterpret_cast<const char*>(rsrc.data()),
-                             static_cast<std::streamsize>(rsrc.size()));
-                    bytes += rsrc.size();
-                    rs.close();
-                    de::applyFileTimes(cp + ".rsrc", t);
-                    de::applyInvokingOwner(cp + ".rsrc");
+                    if (de::writeAppleDouble(cp, rsrc)) {
+                        std::string side = de::appleDoublePath(cp);
+                        bytes += rsrc.size();
+                        de::applyFileTimes(side, t);
+                        de::applyInvokingOwner(side);
+                    }
                 }
                 de::applyFileTimes(cp, t);
                 de::applyInvokingOwner(cp);
@@ -687,13 +660,12 @@ int main(int argc, char** argv) {
                                 os.close();
                                 de::FsTimes t = fs->fileTimes(c);
                                 if (auto rsrc = fs->readResourceFork(c); !rsrc.empty()) {
-                                    std::ofstream rs(cp + ".rsrc", std::ios::binary);
-                                    rs.write(reinterpret_cast<const char*>(rsrc.data()),
-                                             static_cast<std::streamsize>(rsrc.size()));
-                                    bytes += rsrc.size();
-                                    rs.close();
-                                    de::applyFileTimes(cp + ".rsrc", t);
-                                    de::applyInvokingOwner(cp + ".rsrc");
+                                    if (de::writeAppleDouble(cp, rsrc)) {
+                                        std::string side = de::appleDoublePath(cp);
+                                        bytes += rsrc.size();
+                                        de::applyFileTimes(side, t);
+                                        de::applyInvokingOwner(side);
+                                    }
                                 }
                                 // Restore the source dates, so a scripted export
                                 // uploads with the same timeline as the GUI's.
@@ -1033,12 +1005,10 @@ int main(int argc, char** argv) {
                       static_cast<std::streamsize>(data.size()));
             std::fprintf(stderr, "wrote %zu bytes to %s\n", data.size(), argv[5]);
             if (auto rsrc = fs->readResourceFork(f); !rsrc.empty()) {
-                std::string rsrcPath = std::string(argv[5]) + ".rsrc";
-                std::ofstream rs(rsrcPath, std::ios::binary);
-                rs.write(reinterpret_cast<const char*>(rsrc.data()),
-                         static_cast<std::streamsize>(rsrc.size()));
-                std::fprintf(stderr, "wrote %zu bytes to %s\n", rsrc.size(), rsrcPath.c_str());
-                rs.close();
+                std::string rsrcPath = de::appleDoublePath(argv[5]);
+                de::writeAppleDouble(argv[5], rsrc);
+                std::fprintf(stderr, "wrote %zu bytes of resource fork to %s\n",
+                             rsrc.size(), rsrcPath.c_str());
                 de::applyFileTimes(rsrcPath, fs->fileTimes(f));
                 de::applyInvokingOwner(rsrcPath);
             }

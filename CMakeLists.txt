@@ -20,6 +20,7 @@ add_library(de_engine STATIC
   src/core/image_source.cpp
   src/core/file_times.cpp
   src/core/file_owner.cpp
+  src/core/apple_double.cpp
   src/partition/partition.cpp
   src/fs/fs_detect.cpp
   src/fs/ntfs/ntfs.cpp

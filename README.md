@@ -60,7 +60,7 @@ Status:
   Kit, DMDE) refuse to open. Parses the Master Directory Block, reassembles
   the Catalog and Extents-Overflow B-trees (including fragmented catalogs),
   walks the full directory tree, and exports both data and resource forks
-  (resource forks as `<name>.rsrc` sidecars). Validated byte-for-byte against
+  (resource forks as AppleDouble `._<name>` sidecars). Validated byte-for-byte against
   a reference Python implementation on two real 1.44 MB customer floppies,
   including heavily fragmented forks.
 
@@ -367,9 +367,13 @@ NTFS-in-GPT-partition layout).
 - Full tree enumeration with Mac type/creator codes and HFS-epoch timestamps
 - Fork reads consult the **Extents-Overflow B-tree** when the three inline
   extents don't cover the logical length (heavily fragmented files)
-- Exports **both forks**: data fork as the file, resource fork as a
-  `<name>.rsrc` sidecar (via `Filesystem::readResourceFork`, default-empty
-  for filesystems without forks)
+- Exports **both forks**: data fork as the file, resource fork as an
+  AppleDouble `._<name>` sidecar (via `Filesystem::readResourceFork`,
+  default-empty for filesystems without forks). AppleDouble is the form macOS
+  itself writes when copying a Mac file onto a foreign filesystem, so copying
+  the export back onto HFS+/APFS reattaches the fork and the file works again -
+  a raw dump of the fork under another name preserves the bytes but never
+  reattaches, leaving a file that looks recovered but is still broken.
 
 ### Timestamps on export
 

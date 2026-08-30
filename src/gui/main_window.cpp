@@ -3,6 +3,7 @@
 #include "gui/settings.h"
 #include "gui/preferences_dialog.h"
 #include "gui/device_picker.h"
+#include "core/apple_double.h"
 #include "core/file_times.h"
 #include "core/file_owner.h"
 #include "partition/partition.h"
@@ -1082,12 +1083,16 @@ void MainWindow::exportWalk(Filesystem* fs, const FsNode& node, const QString& d
         os.close();
         if (ok && !exportCancel_.load()) {
             ++exportFiles_;
-            // Resource fork (classic HFS): write "<name>.rsrc" sidecar if present.
-            bool wroteRsrc = false;
+            // Resource fork (classic HFS): write an AppleDouble "._name"
+            // sidecar if present. macOS reassembles that back into a real
+            // resource fork when the folder is copied onto an HFS+/APFS volume,
+            // so the customer gets a working file rather than a live-looking
+            // file plus an inert blob of bytes beside it.
+            std::string rsrcPath;
             if (auto rsrc = fs->readResourceFork(node); !rsrc.empty()) {
-                std::ofstream rs((outPath + ".rsrc").toStdString(), std::ios::binary | std::ios::trunc);
-                rs.write(reinterpret_cast<const char*>(rsrc.data()), static_cast<std::streamsize>(rsrc.size()));
-                wroteRsrc = true;
+                std::string dataPath = outPath.toStdString();
+                if (de::writeAppleDouble(dataPath, rsrc))
+                    rsrcPath = de::appleDoublePath(dataPath);
             }
             // Restore the source dates once the data is on disk. The resource
             // fork is part of the same original file, so it gets them too; the
@@ -1095,12 +1100,12 @@ void MainWindow::exportWalk(Filesystem* fs, const FsNode& node, const QString& d
             if (exportKeepTimes_) {
                 FsTimes t = fs->fileTimes(node);
                 de::applyFileTimes(outPath.toStdString(), t);
-                if (wroteRsrc) de::applyFileTimes((outPath + ".rsrc").toStdString(), t);
+                if (!rsrcPath.empty()) de::applyFileTimes(rsrcPath, t);
             }
             // Unconditional, unlike the dates: the customer needs to be able to
             // read the file whether or not they asked to keep the timeline.
             de::applyInvokingOwner(outPath.toStdString());
-            if (wroteRsrc) de::applyInvokingOwner((outPath + ".rsrc").toStdString());
+            if (!rsrcPath.empty()) de::applyInvokingOwner(rsrcPath);
             if (md) {  // write "<hex>  <filename>" sidecar next to the file
                 unsigned char dig[EVP_MAX_MD_SIZE]; unsigned int dl = 0;
                 EVP_DigestFinal_ex(md, dig, &dl);
