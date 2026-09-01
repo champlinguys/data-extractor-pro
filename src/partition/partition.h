@@ -23,11 +23,24 @@ struct Partition {
     }
 };
 
+// How hard to hunt for volumes that no partition table entry points at.
+//
+// A deleted or overwritten partition entry does not touch the volume itself, so
+// the filesystem is usually still sitting there intact in what the table calls
+// free space. Off = trust the table only; Fast = probe the unallocated gaps at
+// the alignments real partitions actually use (a few seconds); Deep = sweep
+// every gap end to end (minutes to hours on a big disk, but sequential).
+enum class OrphanScan { Off, Fast, Deep };
+
 // Scan an image for partitions. Recognises a GPT (via its protective MBR) and
 // falls back to a classic MBR partition table. If neither is present, returns a
 // single whole-image "partition" so the caller can still try to mount an FS
 // that lives directly on the media (common for USB sticks and, notably, for the
 // reconstructed volume behind an Intel RST/Optane cached device).
-std::vector<Partition> scanPartitions(const std::shared_ptr<ImageSource>& img);
+// After the table is parsed, any unallocated gap is searched for volumes the
+// table does not mention; those come back with scheme "found" and are appended
+// after the table's own entries.
+std::vector<Partition> scanPartitions(const std::shared_ptr<ImageSource>& img,
+                                      OrphanScan orphans = OrphanScan::Fast);
 
 } // namespace de

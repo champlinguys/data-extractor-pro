@@ -1,8 +1,10 @@
 #include "partition/partition.h"
 #include "core/byte_reader.h"
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <optional>
+#include <utility>
 
 namespace de {
 
@@ -275,18 +277,234 @@ std::vector<Partition> scanApm(const std::shared_ptr<ImageSource>& img,
     return out;
 }
 
+// ------------------------------------------------------- lost-volume recovery
+//
+// Deleting a partition, or letting an installer rewrite the table, does not
+// touch the volume it pointed at: the boot record, the metadata and the file
+// data all stay exactly where they were. So when the table describes less than
+// the disk holds, the unallocated gaps are worth searching directly.
+//
+// The case this was written for (case brian): a 512 GB UEFI laptop SSD whose
+// GPT listed only the 190 MiB EFI partition and a 990 MiB recovery partition,
+// with 475 GiB of "free space" between them. That gap held an intact
+// BitLocker-encrypted C: starting 128 MiB into the gap. The table was the only
+// thing that had been lost.
+//
+// A candidate is accepted only if it identifies itself *and* its own recorded
+// size is consistent with where it was found, which is what keeps a random
+// 0x55AA in file data from being reported as a partition.
+
+// A volume found by scanning, described by its own on-disk fields.
+struct FoundVolume {
+    std::string typeName;
+    uint64_t lengthBytes = 0;
+};
+
+// Is `v` a power of two within [lo, hi]?
+bool pow2InRange(uint64_t v, uint64_t lo, uint64_t hi) {
+    return v >= lo && v <= hi && (v & (v - 1)) == 0;
+}
+
+// Read the size a BitLocker volume records for itself.
+//
+// The boot record points at up to three copies of the FVE metadata, each of
+// which restates the encrypted volume size. That figure lives inside the
+// volume, so unlike a partition table it cannot be stale - the same reasoning
+// reconcileVolumeSize() already applies once a volume is mounted.
+uint64_t bitlockerSelfSize(const std::shared_ptr<ImageSource>& img,
+                           uint64_t off, const uint8_t* boot) {
+    for (int i = 0; i < 3; ++i) {
+        uint64_t mdOff = rd64(boot + 0xB0 + 8 * i);
+        if (mdOff == 0 || mdOff > img->size() - off) continue;
+        auto md = img->read(off + mdOff, 512);
+        if (md.size() < 512 || std::memcmp(md.data(), "-FVE-FS-", 8) != 0) continue;
+        uint64_t sz = rd64(md.data() + 0x10);
+        if (sz) return sz;
+    }
+    return 0;
+}
+
+// Identify a volume boot record at `off` and work out how long it says it is.
+// Returns nullopt unless the record is self-consistent.
+std::optional<FoundVolume> identifyVolume(const std::shared_ptr<ImageSource>& img,
+                                          uint64_t off) {
+    if (off + 512 > img->size()) return std::nullopt;
+    auto b = img->read(off, 512);
+    if (b.size() < 512) return std::nullopt;
+    // Every one of these records ends in the boot signature. Checking it first
+    // rejects all but 1 in 65536 offsets before any further work.
+    if (b[510] != 0x55 || b[511] != 0xAA) return std::nullopt;
+
+    const uint8_t* p = b.data();
+    uint64_t bps = rd16(p + 0x0B);              // bytes per sector
+    const uint64_t avail = img->size() - off;
+
+    auto accept = [&](const char* name, uint64_t len) -> std::optional<FoundVolume> {
+        if (len == 0 || len > avail) return std::nullopt;
+        return FoundVolume{name, len};
+    };
+
+    if (std::memcmp(p + 3, "-FVE-FS-", 8) == 0) {
+        // BitLocker. Its own "hidden sectors" field is the volume's start LBA,
+        // so it should equal where we found it - a self-check strong enough to
+        // stand on its own.
+        uint64_t hidden = rd32(p + 0x1C);
+        if (bps && hidden && hidden * bps != off) return std::nullopt;
+        uint64_t len = bitlockerSelfSize(img, off, p);
+        return accept("BitLocker encrypted volume", len);
+    }
+    if (std::memcmp(p + 3, "NTFS    ", 8) == 0) {
+        if (!pow2InRange(bps, 512, 4096)) return std::nullopt;
+        if (!pow2InRange(rd8(p + 0x0D), 1, 128)) return std::nullopt;  // sectors/cluster
+        // NTFS records one sector fewer than the partition holds: the last
+        // sector is the backup boot record and is left out of the count.
+        uint64_t len = (rd64(p + 0x28) + 1) * bps;
+        return accept("NTFS", len);
+    }
+    if (std::memcmp(p + 3, "EXFAT   ", 8) == 0) {
+        uint64_t shift = rd8(p + 0x6C);
+        if (shift < 9 || shift > 12) return std::nullopt;
+        return accept("exFAT", rd64(p + 0x48) << shift);
+    }
+    if (std::memcmp(p + 0x52, "FAT32", 5) == 0) {
+        if (!pow2InRange(bps, 512, 4096)) return std::nullopt;
+        return accept("FAT32", rd64(p + 0x20) * bps);   // total sectors (32-bit field)
+    }
+    if (std::memcmp(p + 0x36, "FAT", 3) == 0) {
+        if (!pow2InRange(bps, 512, 4096)) return std::nullopt;
+        uint64_t secs = rd16(p + 0x13);
+        if (!secs) secs = rd32(p + 0x20);
+        return accept("FAT", secs * bps);
+    }
+    return std::nullopt;
+}
+
+// A run of unallocated bytes.
+struct Gap { uint64_t begin, end; };
+
+// The regions of the image no reported partition covers.
+std::vector<Gap> unallocatedGaps(const std::vector<Partition>& parts, uint64_t imgSize) {
+    std::vector<std::pair<uint64_t, uint64_t>> used;
+    for (const auto& p : parts)
+        if (p.lengthBytes) used.emplace_back(p.firstByte, p.firstByte + p.lengthBytes);
+    std::sort(used.begin(), used.end());
+
+    std::vector<Gap> gaps;
+    // The first megabyte holds the partition table itself; a volume never
+    // starts there, and skipping it keeps the protective MBR out of the scan.
+    uint64_t cursor = 1u << 20;
+    for (auto& [b, e] : used) {
+        if (b > cursor) gaps.push_back({cursor, b});
+        cursor = std::max(cursor, e);
+    }
+    if (cursor < imgSize) gaps.push_back({cursor, imgSize});
+    return gaps;
+}
+
+// Search the gaps for volumes the table forgot.
+//
+// Cost is dominated by seeking, so the probe pattern matters more than the
+// number of bytes touched. Two passes, cheapest first:
+//
+//   1. Every sector of the first 32 MiB of a gap, read in big sequential
+//      blocks. Catches a volume that starts immediately after the previous one
+//      and any odd, unaligned legacy geometry, for the price of one streamed
+//      read.
+//   2. Every 1 MiB boundary. Modern partitioners align to 1 MiB without
+//      exception, so this is where a lost volume actually starts. In Fast mode
+//      the pass stops 4 GiB into the gap; Deep runs it to the end.
+//
+// A confirmed volume is recorded and the cursor jumps past its full length,
+// so the scan never reports structures found inside a volume it already knows.
+std::vector<Partition> scanForOrphans(const std::shared_ptr<ImageSource>& img,
+                                      const std::vector<Partition>& known,
+                                      OrphanScan mode) {
+    std::vector<Partition> found;
+    if (mode == OrphanScan::Off) return found;
+
+    constexpr uint64_t SECTOR   = 512;
+    constexpr uint64_t MiB      = 1u << 20;
+    constexpr uint64_t DENSE    = 32 * MiB;    // pass 1 window
+    constexpr uint64_t FAST_CAP = 4096 * MiB;  // pass 2 window in Fast mode
+    constexpr size_t   CHUNK    = 4u << 20;
+
+    auto record = [&](uint64_t off, const FoundVolume& v) {
+        Partition p;
+        p.scheme = "found";
+        p.firstByte = off;
+        p.lengthBytes = v.lengthBytes;
+        p.typeName = v.typeName;
+        found.push_back(std::move(p));
+    };
+
+    for (const auto& g : unallocatedGaps(known, img->size())) {
+        if (g.end - g.begin < MiB) continue;
+
+        // Pass 1: dense, streamed.
+        uint64_t covered = g.begin;   // end of the last volume confirmed here
+        uint64_t denseEnd = std::min(g.end, g.begin + DENSE);
+        std::vector<uint8_t> buf;
+        for (uint64_t off = g.begin; off < denseEnd; ) {
+            size_t want = static_cast<size_t>(std::min<uint64_t>(CHUNK, denseEnd - off));
+            buf.assign(want, 0);
+            size_t got = img->readAt(off, buf.data(), want);
+            if (got < SECTOR) break;
+            bool jumped = false;
+            for (size_t s = 0; s + SECTOR <= got; s += SECTOR) {
+                // Cheap gate: only pay for identifyVolume() where the boot
+                // signature is already present.
+                if (buf[s + 510] != 0x55 || buf[s + 511] != 0xAA) continue;
+                uint64_t at = off + s;
+                if (auto v = identifyVolume(img, at)) {
+                    record(at, *v);
+                    off = covered = at + v->lengthBytes;
+                    jumped = true;
+                    break;
+                }
+            }
+            if (!jumped) off += got;
+        }
+
+        // Pass 2: 1 MiB stride.
+        uint64_t start = (covered + MiB - 1) / MiB * MiB;
+        uint64_t stop = mode == OrphanScan::Deep ? g.end
+                                                 : std::min(g.end, g.begin + FAST_CAP);
+        for (uint64_t off = start; off + SECTOR <= stop; ) {
+            if (auto v = identifyVolume(img, off)) {
+                record(off, *v);
+                covered = off + v->lengthBytes;
+                off = (covered + MiB - 1) / MiB * MiB;
+            } else {
+                off += MiB;
+            }
+        }
+    }
+    return found;
+}
+
 } // namespace
 
-std::vector<Partition> scanPartitions(const std::shared_ptr<ImageSource>& img) {
+std::vector<Partition> scanPartitions(const std::shared_ptr<ImageSource>& img,
+                                      OrphanScan orphans) {
     std::vector<Partition> out;
 
     auto mbr = img->read(0, 512);
 
     // The Apple Partition Map is checked first: its block 0 has no 0x55AA, so
     // it has to be recognised before the MBR path below rejects it.
+    // Appends any volume the table does not account for, then renumbers so the
+    // indices the caller prints stay contiguous.
+    auto withOrphans = [&](std::vector<Partition> table) {
+        for (auto& p : scanForOrphans(img, table, orphans))
+            table.push_back(std::move(p));
+        int n = 1;
+        for (auto& p : table) p.index = n++;
+        return table;
+    };
+
     if (mbr.size() >= 512 && rdBE16(mbr.data()) == APM_DDR_SIGNATURE) {
         out = scanApm(img, mbr);
-        if (!out.empty()) return out;
+        if (!out.empty()) return withOrphans(std::move(out));
     }
 
     // Derived from the table itself, never assumed. See detectSectorSize().
@@ -312,7 +530,7 @@ std::vector<Partition> scanPartitions(const std::shared_ptr<ImageSource>& img) {
 
         if (protective) {
             out = scanGpt(img, sectorSize);
-            if (!out.empty()) return out;
+            if (!out.empty()) return withOrphans(std::move(out));
         }
 
         // Classic MBR primary partitions.
@@ -335,7 +553,7 @@ std::vector<Partition> scanPartitions(const std::shared_ptr<ImageSource>& img) {
             p.index = idx++;
             out.push_back(std::move(p));
         }
-        if (!out.empty()) return out;
+        if (!out.empty()) return withOrphans(std::move(out));
     }
 
     // No usable table: treat the whole image as one volume.

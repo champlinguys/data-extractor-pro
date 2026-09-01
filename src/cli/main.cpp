@@ -58,6 +58,13 @@ static void usage() {
         "  --recovery-key <pw>  BitLocker recovery password, the 48-digit six-group\n"
         "                       form. Any BitLocker partition is decrypted with it,\n"
         "                       so ls/export/tree/find work on the volume inside.\n"
+        "  --deep-scan          hunt for lost partitions across the whole of every\n"
+        "                       unallocated gap, not just its first 4 GiB. Use when\n"
+        "                       a volume you expect is still missing from the list;\n"
+        "                       it reads the gaps end to end, so allow ~1 min per\n"
+        "                       5 GiB on a spinning disk.\n"
+        "  --no-scan            trust the partition table alone and report nothing\n"
+        "                       that it does not list.\n"
         "  --volume-key <hex>   CoreStorage/FileVault 2 volume key, 32 bytes for\n"
         "                       AES-XTS-128 (64 hex chars) or 64 for AES-XTS-256.\n"
         "                       Any CoreStorage partition is decrypted with it, so\n"
@@ -231,6 +238,11 @@ static void maybeUnlockCoreStorage(std::shared_ptr<ImageSource>& vol) {
     }
 }
 
+// How hard to hunt for partitions no table entry points at. Fast probes the
+// unallocated gaps at the alignments partitioners actually use and costs a
+// second or two; --deep-scan sweeps every gap end to end.
+static de::OrphanScan g_orphans = de::OrphanScan::Fast;
+
 // BitLocker recovery password (the 48-digit, six-group form). Empty when the
 // caller did not pass --recovery-key.
 static std::string g_bdeKey;
@@ -274,7 +286,7 @@ static void maybeUnlockBitLocker(const std::shared_ptr<ImageSource>& parent,
 // Resolve a partition and mount its filesystem, or return nullptr with a message.
 static std::unique_ptr<Filesystem> mount(const std::shared_ptr<ImageSource>& img,
                                          int partNo, std::shared_ptr<ImageSource>& volOut) {
-    auto parts = scanPartitions(img);
+    auto parts = scanPartitions(img, g_orphans);
     if (partNo < 1 || partNo > static_cast<int>(parts.size())) {
         std::fprintf(stderr, "no such partition %d (found %zu)\n", partNo, parts.size());
         return nullptr;
@@ -423,6 +435,14 @@ int main(int argc, char** argv) {
             ++i;
             continue;
         }
+        if (std::string(argv[i]) == "--deep-scan") {
+            g_orphans = de::OrphanScan::Deep;
+            continue;
+        }
+        if (std::string(argv[i]) == "--no-scan") {
+            g_orphans = de::OrphanScan::Off;
+            continue;
+        }
         if (std::string(argv[i]) == "--volume-key" && i + 1 < argc) {
             g_csKey = de::corestorage::parseVolumeKey(argv[i + 1]);
             if (!g_csKey) {
@@ -487,7 +507,7 @@ int main(int argc, char** argv) {
             // Show what is actually on the assembled disk.
             auto disk = de::raid::assemble(r.layout);
             std::printf("\npartitions on the assembled disk:\n");
-            for (auto& p : scanPartitions(disk)) {
+            for (auto& p : scanPartitions(disk, g_orphans)) {
                 auto vol = p.asSource(disk);
                 std::printf("  [%d] %-8s @ sector %llu, %.2f GB  type=%s  fs=%s\n",
                             p.index, p.scheme.c_str(),
@@ -512,7 +532,7 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
         uint64_t hint = argc >= 5 ? std::strtoull(argv[4], nullptr, 10) * 512ull : UINT64_MAX;
         auto merged = reconstruct(qlc, opt, hint);
-        for (auto& p : scanPartitions(merged)) {
+        for (auto& p : scanPartitions(merged, g_orphans)) {
             auto vol = p.asSource(merged);
             auto md = de::bitlocker::parseFve(*vol);
             if (!md) continue;
@@ -546,7 +566,7 @@ int main(int argc, char** argv) {
         std::string recovery = argv[5];
         auto merged = reconstruct(qlc, opt, hint);
 
-        for (auto& p : scanPartitions(merged)) {
+        for (auto& p : scanPartitions(merged, g_orphans)) {
             auto vol = p.asSource(merged);
             auto md = de::bitlocker::parseFve(*vol);
             if (!md) continue;
@@ -588,7 +608,7 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
         uint64_t hint = std::strtoull(argv[4], nullptr, 10) * 512ull;
         auto merged = reconstruct(qlc, opt, hint);
-        for (auto& p : scanPartitions(merged)) {
+        for (auto& p : scanPartitions(merged, g_orphans)) {
             auto vol = p.asSource(merged);
             std::string note;
             vol = de::bitlocker::reconcileVolumeSize(merged, p.firstByte, vol, &note);
@@ -711,7 +731,7 @@ int main(int argc, char** argv) {
         auto merged = reconstruct(qlc, opt, hint);
         std::printf("Reconstructed disk: %.2f GB (QLC %.2f GB + Optane span)\n",
                     merged->size() / 1e9, qlc->size() / 1e9);
-        for (auto& p : scanPartitions(merged)) {
+        for (auto& p : scanPartitions(merged, g_orphans)) {
             auto vol = p.asSource(merged);
             std::printf("  [%d] %-8s @ sector %llu, %.2f GB  type=%s  fs=%s\n",
                         p.index, p.scheme.c_str(),
@@ -725,7 +745,7 @@ int main(int argc, char** argv) {
     if (!img) return 1;
 
     if (argc == 2) {
-        auto parts = scanPartitions(img);
+        auto parts = scanPartitions(img, g_orphans);
         std::printf("Image: %s (%.2f MiB)\n", img->name().c_str(),
                     img->size() / 1048576.0);
         for (auto& p : parts) {
@@ -746,7 +766,7 @@ int main(int argc, char** argv) {
     // separate from browsing so it can be run before committing to an export.
     if (cmd == "cs") {
         if (argc < 4) { usage(); return 2; }
-        auto parts = scanPartitions(img);
+        auto parts = scanPartitions(img, g_orphans);
         int partNo = std::atoi(argv[3]);
         if (partNo < 1 || partNo > static_cast<int>(parts.size())) {
             std::fprintf(stderr, "no such partition %d\n", partNo);
