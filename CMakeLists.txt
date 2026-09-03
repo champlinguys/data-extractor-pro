@@ -44,6 +44,7 @@ add_library(de_engine STATIC
   src/bitlocker/volume.cpp
   src/corestorage/cs.cpp
   src/corestorage/source.cpp
+  src/corestorage/unlock.cpp
 )
 target_include_directories(de_engine PUBLIC src)
 target_compile_options(de_engine PRIVATE -Wall -Wextra)

@@ -48,17 +48,21 @@ Status:
   are tried, so a damaged first copy no longer hides the protectors. The AES-XTS
   path is validated byte-for-byte against a reference recovery tool on a real
   Optane H10 case; the Elephant-diffuser CBC variants are not yet supported.
-- **FileVault 2 / CoreStorage decryption** - working, given the volume key:
-  AES-XTS decryption of the CoreStorage logical volume, then browse/extract the
+- **FileVault 2 / CoreStorage decryption** - working from the password alone:
+  the CoreStorage metadata is decrypted with the key in the volume header, the
+  password stretched with PBKDF2-SHA256 and used to unwrap the KEK and then the
+  volume key, and the AES-XTS logical volume decrypted for browse/extract of the
   HFS+ inside. Right-click a locked FileVault 2 partition to unlock it in place,
-  or pass `--volume-key <hex>` to the CLI. The logical volume's start is found
-  by trial-decrypting the HFS+ header rather than assumed, so a key that
-  verifies has proved the offset with it. Validated byte-for-byte against
-  libfvde on a real 12.73 TiB FileVault 2 case (20/20 exact 4 KiB matches from
-  1 KiB to 928 GiB), and - unlike libfvde, which refuses every read past 1 TiB -
-  it reads the whole volume: files at 1.25-1.54 TiB extract intact.
-  Deriving the volume key from the user's passphrase is not implemented yet;
-  the key is supplied ready-made.
+  or pass `--password <pw>` to the CLI; `--volume-key <hex>` still takes a key
+  that is already known. Any account's login password works, as does the
+  personal recovery key macOS printed when FileVault was switched on. A wrong
+  password is refused by the key's own integrity check rather than guessed at.
+  The logical volume's start is found by trial-decrypting the HFS+ header rather
+  than assumed, so a key that verifies has proved the offset with it. Validated
+  byte-for-byte against libfvde on a real 12.73 TiB FileVault 2 case (20/20
+  exact 4 KiB matches from 1 KiB to 928 GiB), and - unlike libfvde, which
+  refuses every read past 1 TiB - it reads the whole volume: files at 1.25-1.54
+  TiB extract intact.
 
 - **Classic HFS (pre-HFS+)** - working: the 1985-1998 Macintosh filesystem
   found on old Mac floppies and small disks, which mainstream tools (Sleuth
@@ -267,16 +271,22 @@ de-cli <image> export-list 2 list.tsv <outdir>
 ## FileVault 2 (CoreStorage) workflow (CLI)
 
 ```sh
-# identify the CoreStorage volume and check whether a key unlocks it
-de-cli <image> cs 2 --volume-key <hex>
+# identify the CoreStorage volume and check whether the password unlocks it
+de-cli <image> cs 2 --password "<password>"
 # browse, search and export the HFS+ volume inside
-de-cli <image> ls      2         --volume-key <hex>
-de-cli <image> find    2 <word>  --volume-key <hex>
-de-cli <image> export  2 <recno> <outdir> --volume-key <hex>
+de-cli <image> ls      2         --password "<password>"
+de-cli <image> find    2 <word>  --password "<password>"
+de-cli <image> export  2 <recno> <outdir> --password "<password>"
 ```
-The volume key is the AES-XTS key pair (cipher key followed by tweak key)
-as hex: 64 characters for AES-XTS-128, 128 for AES-XTS-256. `--volume-key`
-may appear anywhere on the command line.
+`--password` takes the login password of any account allowed to unlock the
+disk, or the personal recovery key macOS printed when FileVault was switched
+on; the volume key is derived from the volume's own key store, so nothing has
+to be recovered from the machine first. `cs` reports whether the password was
+accepted before any export is started.
+
+`--volume-key <hex>` takes the AES-XTS key pair (cipher key followed by tweak
+key) directly, for when it is already known: 64 characters for AES-XTS-128, 128
+for AES-XTS-256. Either option may appear anywhere on the command line.
 
 ## Building
 
@@ -308,6 +318,10 @@ tools/verify_raid.sh       # RAID: split a real disk image into members at a
 tools/verify_bitlocker_clearkey.sh    # BitLocker: a suspended volume, built by
                            # tools/mkbitlocker.py from the format spec, must
                            # open with no credential at all
+tools/verify_corestorage_password.sh  # FileVault 2: build a CoreStorage volume
+                           # locked with a password (tools/mkcorestorage.py does
+                           # the wrapping with Python's own PBKDF2 and AES key
+                           # wrap), then open it with the password alone
 python3 tools/verify_apfs.py   # APFS: synthetic containers from tools/mkapfs.py
 ```
 
@@ -413,7 +427,8 @@ turn it off under *Preferences -> Export -> Timestamps*.
 - **LZFSE decmpfs** - compression types 11/12. Currently reported as
   unsupported rather than exported as corrupt.
 - **FileVault (encrypted APFS)** - the keybag, and AES-XTS volume decryption.
-  Encrypted volumes are already identified and reported.
+  Encrypted volumes are already identified and reported. The CoreStorage
+  (HFS+-era) side of FileVault is done, password and all.
 - **RAID 5/6** - parity sets. Only striping, concatenation and mirroring are
   handled today.
 - **RAID descriptors** - the enclosure descriptor in the last sector of each

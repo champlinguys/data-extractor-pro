@@ -14,6 +14,7 @@
 #include "bitlocker/fve.h"
 #include "corestorage/cs.h"
 #include "corestorage/source.h"
+#include "corestorage/unlock.h"
 #include <QBrush>
 #include <QColor>
 
@@ -587,7 +588,7 @@ void MainWindow::buildTree(const std::vector<PreparedVol>& vols, const QString& 
                                 "the recovery key");
         else if (csLocked)
             item->setToolTip(0, "Locked FileVault 2 volume - right-click to enter "
-                                "the volume key");
+                                "the password");
         // Add the lazy-load placeholder (what gives the row its expand arrow)
         // only for a filesystem detectFilesystem() can mount: not a stub label
         // ("... not yet implemented"), not an unrecognised volume, and not any
@@ -733,22 +734,21 @@ void MainWindow::unlockCoreStorageItem(QTreeWidgetItem* partitionItem) {
     if (vit == volumes_.end() || !vit->second) return;
 
     bool ok = false;
-    QString keyText = QInputDialog::getText(
+    QString secretText = QInputDialog::getText(
         this, "Unlock FileVault 2",
-        "Enter the CoreStorage volume key for this volume, in hex\n"
-        "(64 characters for AES-XTS-128):",
+        "Enter the FileVault 2 password for this volume - a login password of\n"
+        "any account allowed to unlock the disk, or the personal recovery key.\n"
+        "\n"
+        "A CoreStorage volume key in hex (64 characters for AES-XTS-128) works\n"
+        "here too, if you already have one.",
         QLineEdit::Normal, QString(), &ok);
-    keyText = keyText.trimmed();
-    if (!ok || keyText.isEmpty()) return;
+    secretText = secretText.trimmed();
+    if (!ok || secretText.isEmpty()) return;
 
-    auto key = de::corestorage::parseVolumeKey(keyText.toStdString());
-    if (!key) {
-        QMessageBox::warning(this, "Unlock FileVault 2",
-            "That is not a usable volume key.\n\n"
-            "It must be 64 hex characters for AES-XTS-128 (a 32-byte key), or "
-            "128 for AES-XTS-256.");
-        return;
-    }
+    // Hex of the right length can only be a volume key; anything else is a
+    // password, which the key store has to be walked for.
+    auto key = de::corestorage::parseVolumeKey(secretText.toStdString());
+    std::string password = key ? std::string() : secretText.toStdString();
 
     // Finding the logical volume means trial-decrypting a sector per candidate
     // offset over what may be a slow image, so run it on a worker thread behind
@@ -758,15 +758,26 @@ void MainWindow::unlockCoreStorageItem(QTreeWidgetItem* partitionItem) {
     std::string note;
     std::atomic<bool> done{false};
 
-    QProgressDialog progress("Looking for the logical volume and checking the key...\n"
-                             "This can take a moment.", QString(), 0, 0, this);
+    QProgressDialog progress("Deriving the volume key and looking for the logical\n"
+                             "volume. This can take a moment.", QString(), 0, 0, this);
     progress.setWindowTitle("Unlocking");
     progress.setWindowModality(Qt::ApplicationModal);
     progress.setCancelButton(nullptr);   // the unlock isn't interruptible
     progress.setMinimumDuration(0);
 
     std::thread worker([&] {
-        dec = de::corestorage::unlockVolume(enc, *key, &note);
+        if (!key) {
+            // Stretching the password is deliberately slow, and the metadata it
+            // is checked against has to be read off the disk first, so this
+            // belongs on the worker thread with the search that follows it.
+            auto header = de::corestorage::parseHeader(*enc);
+            if (header)
+                key = de::corestorage::volumeKeyFromPassword(*enc, *header,
+                                                             password, &note);
+            else
+                note = "not a CoreStorage volume";
+        }
+        if (key) dec = de::corestorage::unlockVolume(enc, *key, &note);
         done = true;
     });
     QTimer timer;
@@ -783,8 +794,8 @@ void MainWindow::unlockCoreStorageItem(QTreeWidgetItem* partitionItem) {
             QString("Could not unlock this volume.\n\n%1")
                 .arg(QString::fromStdString(note)));
         QString typeName = QString(partitionItem->text(0)).section('(', 0, 0).trimmed();
-        partitionItem->setText(0, QString("%1  (FileVault 2 (unlock failed - wrong key?))")
-                                      .arg(typeName));
+        partitionItem->setText(0, QString("%1  (FileVault 2 (unlock failed - wrong "
+                                          "password or key?))").arg(typeName));
         return;
     }
 

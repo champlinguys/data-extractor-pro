@@ -16,8 +16,10 @@ constexpr size_t BLOCK_SIZE_OFFSET         = 0x30;
 constexpr size_t VOLUME_SIZE_OFFSET        = 0x40;
 constexpr size_t METADATA_BLOCK_SIZE_OFFSET= 0x60;
 constexpr size_t METADATA_SIZE_OFFSET      = 0x64;
-constexpr size_t METADATA_BLOCKS_OFFSET    = 0x70;  // four u64s, unused slots zeroed
+constexpr size_t METADATA_BLOCKS_OFFSET    = 0x68;  // four u64s, unused slots zeroed
 constexpr size_t METADATA_BLOCK_SLOTS      = 4;
+constexpr size_t KEY_DATA_OFFSET           = 0xB0; // 128 bytes; the first 16 are
+                                                   // the metadata's AES-XTS key
 constexpr size_t ENCRYPTION_METHOD_OFFSET  = 0xAC;
 constexpr size_t UUID_OFFSET               = 0x130; // big-endian, i.e. RFC 4122 order
 
@@ -67,6 +69,8 @@ std::optional<VolumeHeader> parseHeader(ImageSource& vol) {
     h.physicalVolumeSize = rd64(head + VOLUME_SIZE_OFFSET);
     h.encryptionMethod   = rd32(head + ENCRYPTION_METHOD_OFFSET);
     h.identifier         = formatUuid(head + UUID_OFFSET);
+    std::memcpy(h.identifierBytes, head + UUID_OFFSET, 16);
+    std::memcpy(h.keyData, head + KEY_DATA_OFFSET, 16);
     h.metadataBlockSize  = rd32(head + METADATA_BLOCK_SIZE_OFFSET);
     h.metadataSize       = rd32(head + METADATA_SIZE_OFFSET);
     for (size_t i = 0; i < METADATA_BLOCK_SLOTS; ++i) {

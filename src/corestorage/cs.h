@@ -16,11 +16,11 @@
 // was verified against: 20/20 exact 4 KiB matches at offsets from 1 KiB to
 // 928 GiB.
 //
-// Scope note: this module deliberately stops short of the key hierarchy. The
-// passphrase -> KEK -> volume-key unwrap needs the encrypted CoreStorage
-// metadata parsed, which is a separate job; here the volume key is supplied
-// ready-made. Everything downstream of the key - the mapping, the sector
-// decryption, the volume discovery - is ours and has no size ceiling.
+// The key hierarchy - passphrase -> KEK -> volume key - lives next door in
+// unlock.h, which walks the encrypted CoreStorage metadata to get there. This
+// file stops at the volume header and the ready-made volume key. Everything
+// downstream of the key - the mapping, the sector decryption, the volume
+// discovery - is ours and has no size ceiling.
 namespace de::corestorage {
 
 // The header sits in the first sector of the CoreStorage physical volume.
@@ -41,9 +41,16 @@ struct VolumeHeader {
     uint64_t physicalVolumeSize = 0;    // bytes; matches the GPT partition size
     uint32_t encryptionMethod = 0;
     std::string identifier;             // physical volume UUID, as macOS shows it
-    uint32_t metadataBlockSize = 0;
-    uint32_t metadataSize = 0;
+    uint32_t metadataBlockSize = 0;     // bytes per metadata block number
+    uint32_t metadataSize = 0;          // bytes of metadata at each copy
     std::vector<uint64_t> metadataBlocks;
+
+    // Raw material the key hierarchy needs (see unlock.h). `keyData` is the
+    // AES-XTS key the CoreStorage metadata itself is encrypted with, and the
+    // physical volume UUID doubles as its tweak key - so these two together
+    // open the metadata, and the metadata leads to the volume key.
+    uint8_t keyData[16] = {};
+    uint8_t identifierBytes[16] = {};
 
     bool isEncrypted() const { return encryptionMethod != ENCRYPTION_NONE; }
     const char* methodName() const;

@@ -13,6 +13,7 @@
 #include "bitlocker/volume.h"
 #include "corestorage/cs.h"
 #include "corestorage/source.h"
+#include "corestorage/unlock.h"
 #include "core/apple_double.h"
 #include "raid/raid.h"
 #include "raid/raid_detect.h"
@@ -69,10 +70,17 @@ static void usage() {
         "                       5 GiB on a spinning disk.\n"
         "  --no-scan            trust the partition table alone and report nothing\n"
         "                       that it does not list.\n"
+        "  --password <pw>      FileVault 2 password: a login password of any\n"
+        "                       account allowed to unlock the disk, or the\n"
+        "                       personal recovery key macOS printed when FileVault\n"
+        "                       was switched on. The volume key is derived from the\n"
+        "                       volume's own key store, so nothing else is needed.\n"
         "  --volume-key <hex>   CoreStorage/FileVault 2 volume key, 32 bytes for\n"
         "                       AES-XTS-128 (64 hex chars) or 64 for AES-XTS-256.\n"
-        "                       Any CoreStorage partition is decrypted with it, so\n"
-        "                       ls/export/tree/find work on the volume inside.\n"
+        "                       Use it when the key is already known; --password\n"
+        "                       works it out. Any CoreStorage partition is\n"
+        "                       decrypted with it, so ls/export/tree/find work on\n"
+        "                       the volume inside.\n"
         "\n"
         "<source> is an image file, a device (/dev/sdc), an Optane set, or a RAID\n"
         "set:\n"
@@ -218,22 +226,47 @@ static std::shared_ptr<ImageSource> openSource(const std::string& spec) {
     return disk;
 }
 
-// The CoreStorage volume key from --volume-key, if one was given. Phase 1 takes
-// the key ready-made; deriving it from the passphrase is a separate job (see
-// corestorage/cs.h).
+// The CoreStorage volume key from --volume-key, if one was given, and the
+// password from --password. Either opens the volume: the key is used as it
+// stands, a password is walked through the volume's key store first (see
+// corestorage/unlock.h).
 static std::optional<de::corestorage::VolumeKey> g_csKey;
+static std::string g_csPassword;
+
+// The volume key to open `vol` with: the one handed to us, or the one the
+// password derives. Returns nullopt - with a reason in `note` - when neither
+// was given or the password does not open this volume.
+static std::optional<de::corestorage::VolumeKey>
+coreStorageKeyFor(ImageSource& vol, std::string* note) {
+    if (g_csKey) return g_csKey;
+    if (g_csPassword.empty()) {
+        if (note) *note = "no --volume-key or --password given";
+        return std::nullopt;
+    }
+    auto header = de::corestorage::parseHeader(vol);
+    if (!header) {
+        if (note) *note = "not a CoreStorage volume";
+        return std::nullopt;
+    }
+    return de::corestorage::volumeKeyFromPassword(vol, *header, g_csPassword, note);
+}
 
 // If `vol` is a CoreStorage volume and we hold a key, swap in the decrypted
 // view so the rest of the tool sees an ordinary HFS+ volume. Left untouched
 // when it is not CoreStorage, so this is safe to call on every partition.
 static void maybeUnlockCoreStorage(std::shared_ptr<ImageSource>& vol) {
-    if (!g_csKey) return;
+    if (!g_csKey && g_csPassword.empty()) return;
     uint8_t head[512] = {};
     size_t n = vol->readAt(0, head, sizeof head);
     if (!de::corestorage::looksLikeCoreStorage(head, n)) return;
 
     std::string note;
-    auto dec = de::corestorage::unlockVolume(vol, *g_csKey, &note);
+    auto key = coreStorageKeyFor(*vol, &note);
+    if (!key) {
+        std::fprintf(stderr, "CoreStorage: could not unlock - %s\n", note.c_str());
+        return;
+    }
+    auto dec = de::corestorage::unlockVolume(vol, *key, &note);
     if (dec) {
         std::fprintf(stderr, "CoreStorage: %s\n", note.c_str());
         vol = dec;
@@ -461,6 +494,11 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--no-scan") {
             g_orphans = de::OrphanScan::Off;
+            continue;
+        }
+        if (std::string(argv[i]) == "--password" && i + 1 < argc) {
+            g_csPassword = argv[i + 1];
+            ++i;
             continue;
         }
         if (std::string(argv[i]) == "--volume-key" && i + 1 < argc) {
@@ -860,12 +898,16 @@ int main(int argc, char** argv) {
                     h->metadataSize, h->metadataBlockSize);
         for (auto b : h->metadataBlocks)
             std::printf("  metadata block    : %llu\n", (unsigned long long)b);
-        if (!g_csKey) {
-            std::printf("\n  no --volume-key given, so the volume was not unlocked\n");
+        if (!g_csKey && g_csPassword.empty()) {
+            std::printf("\n  no --password or --volume-key given, so the volume was "
+                        "not unlocked\n");
             return 0;
         }
         std::string note;
-        auto dec = de::corestorage::unlockVolume(vol, *g_csKey, &note);
+        auto key = coreStorageKeyFor(*vol, &note);
+        if (!key) { std::fprintf(stderr, "\n  unlock failed: %s\n", note.c_str()); return 1; }
+        if (!g_csKey) std::printf("\n  %s\n", note.c_str());
+        auto dec = de::corestorage::unlockVolume(vol, *key, &note);
         if (!dec) { std::fprintf(stderr, "\n  unlock failed: %s\n", note.c_str()); return 1; }
         std::printf("\n  unlocked: %s\n", note.c_str());
         std::printf("  logical volume    : %llu bytes (%.2f TiB)\n",
