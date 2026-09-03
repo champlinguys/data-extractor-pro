@@ -38,7 +38,12 @@ struct VmkProtector {
     uint16_t protectionTypeRaw = 0;
     uint8_t salt[16] = {};             // stretch-key salt (recovery/passphrase)
     bool hasSalt = false;
-    std::optional<AesCcmKey> encryptedVmk;   // VMK wrapped by the stretch key
+    std::optional<AesCcmKey> encryptedVmk;   // VMK wrapped by the protector's key
+    // Present only on a clear-key protector (type 0x0000), which BitLocker
+    // writes while encryption is *suspended*: the key that unwraps the VMK is
+    // stored beside it in the clear, so the volume opens with no credential at
+    // all. Empty for every other protector type.
+    std::vector<uint8_t> clearKey;
 };
 
 struct FveMetadata {

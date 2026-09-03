@@ -91,7 +91,43 @@ std::vector<uint8_t> extractKey(const std::vector<uint8_t>& plain) {
     if (plain.size() <= 12) return {};
     return std::vector<uint8_t>(plain.begin() + 12, plain.end());
 }
+
+// Given the key that unwraps a protector's VMK, finish the job: unwrap the VMK,
+// then use it to unwrap the FVEK. Shared by every protector type - they differ
+// only in how the unwrapping key is obtained (stretched from a recovery
+// password, or read straight out of the metadata for a clear key).
+std::optional<VolumeKeys> fvekFromVmkKey(const FveMetadata& md,
+                                         const std::vector<uint8_t>& unwrapKey,
+                                         const AesCcmKey& wrappedVmk) {
+    auto vmkPlain = aesCcmDecrypt(unwrapKey, wrappedVmk.nonce, wrappedVmk.macAndData);
+    if (!vmkPlain) return std::nullopt;          // MAC failed: wrong key
+    auto vmk = extractKey(*vmkPlain);
+    if (vmk.size() < 32) return std::nullopt;
+    vmk.resize(32);
+
+    if (!md.encryptedFvek) return std::nullopt;
+    auto fvekPlain = aesCcmDecrypt(vmk, md.encryptedFvek->nonce,
+                                   md.encryptedFvek->macAndData);
+    if (!fvekPlain) return std::nullopt;
+    VolumeKeys keys;
+    keys.fvek = extractKey(*fvekPlain);
+    keys.method = md.method;
+    return keys;
+}
 } // namespace
+
+std::optional<VolumeKeys> unlockWithClearKey(const FveMetadata& md) {
+    for (const auto& vmkProt : md.vmks) {
+        if (vmkProt.protectionTypeRaw != 0x0000) continue;   // clear key
+        if (vmkProt.clearKey.empty() || !vmkProt.encryptedVmk) continue;
+        // AES-CCM here is AES-256; a clear key is 256 bits. Anything else is
+        // not a shape we can use, and guessing would only produce a bad key.
+        if (vmkProt.clearKey.size() < 32) continue;
+        std::vector<uint8_t> k(vmkProt.clearKey.begin(), vmkProt.clearKey.begin() + 32);
+        if (auto keys = fvekFromVmkKey(md, k, *vmkProt.encryptedVmk)) return keys;
+    }
+    return std::nullopt;
+}
 
 std::optional<VolumeKeys> unlockWithRecovery(const FveMetadata& md,
                                              const std::string& recoveryPassword) {
@@ -103,21 +139,7 @@ std::optional<VolumeKeys> unlockWithRecovery(const FveMetadata& md,
         if (!vmkProt.hasSalt || !vmkProt.encryptedVmk) continue;
 
         auto stretch = deriveStretchKey(*bin, vmkProt.salt);
-        auto vmkPlain = aesCcmDecrypt(stretch, vmkProt.encryptedVmk->nonce,
-                                      vmkProt.encryptedVmk->macAndData);
-        if (!vmkPlain) return std::nullopt;      // wrong password
-        auto vmk = extractKey(*vmkPlain);
-        if (vmk.size() < 32) return std::nullopt;
-        vmk.resize(32);
-
-        if (!md.encryptedFvek) return std::nullopt;
-        auto fvekPlain = aesCcmDecrypt(vmk, md.encryptedFvek->nonce,
-                                       md.encryptedFvek->macAndData);
-        if (!fvekPlain) return std::nullopt;
-        VolumeKeys keys;
-        keys.fvek = extractKey(*fvekPlain);
-        keys.method = md.method;
-        return keys;
+        return fvekFromVmkKey(md, stretch, *vmkProt.encryptedVmk);
     }
     return std::nullopt;
 }

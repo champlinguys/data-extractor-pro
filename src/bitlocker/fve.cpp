@@ -14,6 +14,11 @@ constexpr uint16_t ENTRY_DESCRIPTION  = 0x0007;
 constexpr uint16_t ENTRY_VOLUME_HDR   = 0x000F;
 
 // FVE value types (libbde "metadata value type").
+// Largest FVE metadata block we will believe. Real ones run to tens of KB;
+// anything beyond this is a corrupt length field, not a bigger volume.
+constexpr uint32_t MAX_METADATA_SIZE = 1u << 20;
+
+constexpr uint16_t VALUE_KEY         = 0x0001;
 constexpr uint16_t VALUE_STRETCH_KEY = 0x0003;
 constexpr uint16_t VALUE_AESCCM_KEY  = 0x0005;
 constexpr uint16_t VALUE_UNICODE     = 0x0002;
@@ -79,8 +84,13 @@ void parseVmk(const uint8_t* v, size_t len, VmkProtector& out) {
             // we do NOT descend here.
             std::memcpy(out.salt, d + 4, 16);
             out.hasSalt = true;
+        } else if (vt == VALUE_KEY && dl > 4 && out.clearKey.empty()) {
+            // A bare key sitting in the metadata: u32 encryption method, then
+            // the key bytes. Only a clear-key protector carries one, and it is
+            // exactly what unwraps that protector's VMK.
+            out.clearKey.assign(d + 4, d + dl);
         } else if (vt == VALUE_AESCCM_KEY && !out.encryptedVmk) {
-            out.encryptedVmk = parseAesCcm(d, dl); // VMK wrapped by the stretch key
+            out.encryptedVmk = parseAesCcm(d, dl); // VMK wrapped by this protector
         }
     });
 }
@@ -99,34 +109,39 @@ const char* methodName(EncryptionMethod m) {
     }
 }
 
-std::optional<FveMetadata> parseFve(ImageSource& volume) {
-    auto boot = volume.read(0, 512);
-    if (std::memcmp(boot.data() + 3, "-FVE-FS-", 8) != 0)
-        return std::nullopt;
+namespace {
 
-    // Three FVE metadata block offsets (volume-relative) at 0xB0/0xB8/0xC0.
-    uint64_t fveOff = rd64(&boot[0xB0]);
-    if (fveOff == 0 || fveOff > volume.size()) return std::nullopt;
+// Parse one FVE metadata copy at `fveOff` (volume-relative). Returns nullopt if
+// that copy is absent or unusable, so the caller can try the next one.
+std::optional<FveMetadata> parseFveAt(ImageSource& volume, uint64_t fveOff) {
+    if (fveOff == 0 || fveOff >= volume.size()) return std::nullopt;
 
-    auto blk = volume.read(fveOff, 8192);
-    if (std::memcmp(blk.data(), "-FVE-FS-", 8) != 0) return std::nullopt;
+    // The metadata is variable length and routinely larger than a single
+    // sector: a volume with a TPM protector and both validation entries runs to
+    // ~16 KB. Read the header first and let it say how much to read, rather
+    // than guessing a fixed buffer - guessing silently fails on exactly the
+    // volumes that carry the most protectors.
+    auto head = volume.read(fveOff, 512);
+    if (head.size() < 0x40 + 0x28) return std::nullopt;
+    if (std::memcmp(head.data(), "-FVE-FS-", 8) != 0) return std::nullopt;
 
-    // FVE metadata header sits at block+0x40; entries follow header_size.
+    uint32_t metaSize   = rd32(&head[0x40 + 0x00]);
+    uint32_t headerSize = rd32(&head[0x40 + 0x08]);
+    if (headerSize < 0x30 || metaSize < headerSize) return std::nullopt;
+    if (metaSize > MAX_METADATA_SIZE) return std::nullopt;   // corrupt length
+
+    auto blk = volume.read(fveOff, 0x40 + metaSize);
+    if (blk.size() < 0x40 + metaSize) return std::nullopt;
+
     const uint8_t* h = &blk[0x40];
-    uint32_t metaSize   = rd32(h + 0x00);
-    uint32_t headerSize = rd32(h + 0x08);
-    if (metaSize < headerSize || 0x40 + metaSize > blk.size()) return std::nullopt;
-
     FveMetadata md;
     // Metadata *block* header field, not the metadata header at +0x40.
     md.encryptedVolumeSize = rd64(&blk[0x10]);
     std::memcpy(md.volumeGuid, h + 0x10, 16);
     md.method = static_cast<EncryptionMethod>(rd16(h + 0x24));
 
-    const uint8_t* entries = h + headerSize;
-    size_t entriesLen = metaSize - headerSize;
-    walkEntries(entries, entriesLen, [&](uint16_t et, uint16_t vt,
-                                         const uint8_t* d, size_t dl) {
+    walkEntries(h + headerSize, metaSize - headerSize,
+                [&](uint16_t et, uint16_t vt, const uint8_t* d, size_t dl) {
         if (et == ENTRY_DESCRIPTION && vt == VALUE_UNICODE) {
             md.description = utf16le(d, dl);
         } else if (et == ENTRY_VMK) {
@@ -141,7 +156,27 @@ std::optional<FveMetadata> parseFve(ImageSource& volume) {
             md.headerBlockSize = rd64(d + 8);
         }
     });
+    // A copy that yielded no way in is not worth returning while another copy
+    // might still be intact.
+    if (md.vmks.empty() || !md.encryptedFvek) return std::nullopt;
     return md;
+}
+
+} // namespace
+
+std::optional<FveMetadata> parseFve(ImageSource& volume) {
+    auto boot = volume.read(0, 512);
+    if (boot.size() < 0xC8) return std::nullopt;
+    if (std::memcmp(boot.data() + 3, "-FVE-FS-", 8) != 0) return std::nullopt;
+
+    // BitLocker keeps three copies of the metadata, at the offsets stored at
+    // 0xB0/0xB8/0xC0. They are written to be redundant, so a damaged or
+    // partially overwritten first copy is not the end of the volume - try each
+    // in turn and take the first that parses.
+    for (int i = 0; i < 3; ++i)
+        if (auto md = parseFveAt(volume, rd64(&boot[0xB0 + 8 * i])))
+            return md;
+    return std::nullopt;
 }
 
 std::shared_ptr<ImageSource> reconcileVolumeSize(std::shared_ptr<ImageSource> parent,

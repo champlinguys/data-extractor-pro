@@ -30,6 +30,20 @@ std::optional<std::vector<uint8_t>>
 aesCcmDecrypt(const std::vector<uint8_t>& key, const uint8_t nonce[12],
               const std::vector<uint8_t>& macAndData);
 
+// Unlock a volume whose encryption is *suspended*, needing no credential.
+//
+// Suspending BitLocker (a firmware update, or a technician pausing it before
+// service) leaves the volume fully encrypted but adds a "clear key" protector:
+// the key that unwraps the VMK is written into the metadata in the clear. Any
+// holder of the disk can then open it. Worth trying on every locked volume
+// before asking for a key, because it costs one AES-CCM operation and the
+// drives that reach a recovery bench are exactly the ones service was
+// interrupted on.
+//
+// Returns nullopt when no clear-key protector is present, which is the normal
+// case for a volume that was simply locked rather than suspended.
+std::optional<VolumeKeys> unlockWithClearKey(const FveMetadata& md);
+
 // Full unlock: derive from the recovery password, unwrap the VMK via the
 // recovery protector, then unwrap the FVEK. nullopt if the password is wrong
 // (any MAC fails) or no recovery protector is present.

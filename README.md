@@ -40,7 +40,12 @@ Status:
 - **BitLocker decryption** - working: recovery password -> VMK -> FVEK, then
   AES-XTS-128/256 or AES-CBC-128/256 sector decryption, browse/extract the
   decrypted NTFS. Enter the recovery key up front (Open Optane Set) or
-  right-click a locked BitLocker partition to unlock it in place. The AES-XTS
+  right-click a locked BitLocker partition to unlock it in place. A volume whose
+  encryption was left *suspended* - a firmware update, or service interrupted
+  mid-job - carries a clear-key protector and opens with no credential at all;
+  that is tried on every locked volume before a key is asked for, and
+  `de-cli <image> bde <part#>` says whether it worked. All three metadata copies
+  are tried, so a damaged first copy no longer hides the protectors. The AES-XTS
   path is validated byte-for-byte against a reference recovery tool on a real
   Optane H10 case; the Elephant-diffuser CBC variants are not yet supported.
 - **FileVault 2 / CoreStorage decryption** - working, given the volume key:
@@ -300,6 +305,9 @@ tools/verify_hfsplus.sh    # HFS+: mkfs.hfsplus + the kernel driver create it,
 tools/verify_raid.sh       # RAID: split a real disk image into members at a
                            # stripe size the detector is not told, then check
                            # it recovers the geometry and every file
+tools/verify_bitlocker_clearkey.sh    # BitLocker: a suspended volume, built by
+                           # tools/mkbitlocker.py from the format spec, must
+                           # open with no credential at all
 python3 tools/verify_apfs.py   # APFS: synthetic containers from tools/mkapfs.py
 ```
 

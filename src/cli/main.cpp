@@ -51,6 +51,10 @@ static void usage() {
         "  de-cli <source> tree <part#> <out.txt> [out.html] [--dirs-only]\n"
         "                                       write the whole listing to a file\n"
         "                                       (.html gets a search box)\n"
+        "  de-cli <source> bde <part#>          show BitLocker info: encryption\n"
+        "                                       method, and every key protector the\n"
+        "                                       volume carries. Says whether it can\n"
+        "                                       be opened with no credential.\n"
         "  de-cli <source> cs <part#>           show CoreStorage (FileVault 2) info\n"
         "  de-cli <optane> imsm [hintSector]    parse Intel IMSM/RST metadata\n"
         "\n"
@@ -264,13 +268,29 @@ static bool looksLikeBitLocker(ImageSource& vol) {
 static void maybeUnlockBitLocker(const std::shared_ptr<ImageSource>& parent,
                                  uint64_t baseByte,
                                  std::shared_ptr<ImageSource>& vol) {
-    if (g_bdeKey.empty() || !looksLikeBitLocker(*vol)) return;
+    // Note the missing g_bdeKey check: a suspended volume carries a clear-key
+    // protector and opens with no credential, so this runs regardless.
+    if (!looksLikeBitLocker(*vol)) return;
 
     // The partition table can describe a shorter volume than BitLocker itself
     // does; reconcile before unlocking or the tail of the filesystem is lost.
     std::string note;
     vol = de::bitlocker::reconcileVolumeSize(parent, baseByte, vol, &note);
     if (!note.empty()) std::fprintf(stderr, "BitLocker: %s\n", note.c_str());
+
+    // Always try the no-credential path first. If BitLocker was left suspended
+    // the volume opens here and no key is ever needed.
+    if (auto md = de::bitlocker::parseFve(*vol)) {
+        if (auto keys = de::bitlocker::unlockWithClearKey(*md)) {
+            std::fprintf(stderr,
+                "BitLocker: clear-key protector present - encryption was left "
+                "suspended, so this volume unlocked with no credential\n");
+            vol = std::make_shared<de::bitlocker::BitLockerSource>(
+                vol, *keys, md->headerBlockOffset, md->headerBlockSize);
+            return;
+        }
+    }
+    if (g_bdeKey.empty()) return;
 
     if (auto dec = de::bitlocker::unlockVolume(vol, g_bdeKey)) {
         std::fprintf(stderr, "BitLocker: unlocked (%.2f GB plaintext)\n",
@@ -764,6 +784,56 @@ int main(int argc, char** argv) {
     // Report what CoreStorage says about a partition, and - if a key was given -
     // whether it actually unlocks. This is the "does the key work" check, kept
     // separate from browsing so it can be run before committing to an export.
+    if (cmd == "bde") {
+        if (argc < 4) { usage(); return 2; }
+        auto parts = scanPartitions(img, g_orphans);
+        int partNo = std::atoi(argv[3]);
+        if (partNo < 1 || partNo > static_cast<int>(parts.size())) {
+            std::fprintf(stderr, "no such partition %d\n", partNo);
+            return 1;
+        }
+        auto v = parts[partNo - 1].asSource(img);
+        auto md = de::bitlocker::parseFve(*v);
+        if (!md) {
+            std::fprintf(stderr, "partition %d is not a BitLocker volume\n", partNo);
+            return 1;
+        }
+        std::printf("BitLocker volume on partition %d\n", partNo);
+        if (!md->description.empty())
+            std::printf("  label       : %s\n", md->description.c_str());
+        std::printf("  encryption  : %s%s\n",
+                    de::bitlocker::methodName(md->method),
+                    de::bitlocker::methodSupported(md->method) ? ""
+                        : "  (not supported for decryption)");
+        std::printf("  volume size : %llu bytes\n",
+                    (unsigned long long)md->encryptedVolumeSize);
+        std::printf("  protectors  : %zu\n", md->vmks.size());
+        for (const auto& v2 : md->vmks)
+            std::printf("    - %s (0x%04x)%s\n", v2.protectionType.c_str(),
+                        v2.protectionTypeRaw,
+                        v2.protectionTypeRaw == 0x0000 ? "  <- opens with no credential" : "");
+
+        // The question a bench actually asks: can I read this disk right now?
+        if (auto keys = de::bitlocker::unlockWithClearKey(*md)) {
+            std::printf("\n  SUSPENDED: a clear-key protector unwrapped the FVEK.\n"
+                        "  This volume can be read with no password or recovery key.\n");
+            return 0;
+        }
+        bool hasClear = false;
+        for (const auto& v2 : md->vmks) if (v2.protectionTypeRaw == 0x0000) hasClear = true;
+        if (hasClear)
+            std::printf("\n  a clear-key protector is present but did not unwrap the "
+                        "VMK; the metadata may be damaged\n");
+        else
+            std::printf("\n  no clear-key protector: this volume was locked, not "
+                        "suspended, so it needs a credential.\n"
+                        "  Of the protectors above, only a recovery password can be "
+                        "used away from the original machine\n"
+                        "  (a TPM protector's key never leaves the motherboard it was "
+                        "sealed to).\n");
+        return 0;
+    }
+
     if (cmd == "cs") {
         if (argc < 4) { usage(); return 2; }
         auto parts = scanPartitions(img, g_orphans);
