@@ -10,18 +10,18 @@ paired QLC-NAND image and Optane-cache image.
 
 ## Download
 Prebuilt Linux binaries are on the [Releases](../../releases) page - no building
-required. The latest version is **v0.7.0**.
+required. The latest version is **v0.7.1**.
 
 **GUI** (Qt and OpenSSL are bundled in, so there are no dependencies to install):
 ```sh
-wget https://github.com/champlinguys/data-extractor-pro/releases/download/v0.7.0/DataExtractorPro-x86_64.AppImage
+wget https://github.com/champlinguys/data-extractor-pro/releases/download/v0.7.1/DataExtractorPro-x86_64.AppImage
 chmod +x DataExtractorPro-x86_64.AppImage
 ./DataExtractorPro-x86_64.AppImage
 ```
 
 **Headless CLI**:
 ```sh
-wget https://github.com/champlinguys/data-extractor-pro/releases/download/v0.7.0/de-cli-linux-x86_64.tar.gz
+wget https://github.com/champlinguys/data-extractor-pro/releases/download/v0.7.1/de-cli-linux-x86_64.tar.gz
 tar xzf de-cli-linux-x86_64.tar.gz
 ./de-cli
 ```

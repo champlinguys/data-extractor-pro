@@ -40,17 +40,26 @@ echo "only readable with the password" > "$MNT/Documents/note.txt"
 cp "$MNT/Documents/artwork.psd" "$WORK/ref.psd"
 sudo umount "$MNT"
 
-# Run everything twice: with the key store stored as plain XML, and deflated
-# across a chain of metadata blocks, which is the shape a real volume with
-# several accounts on it uses.
-for LAYOUT in plain compressed; do
+# Run everything against each shape a key store comes in: plain XML or deflated
+# across a chain of metadata blocks, and each of those written the way this
+# generator always has or the way a real macOS volume does - plist tags carrying
+# ID attributes, and the volume groups descriptor sitting past the block its
+# checksum covers. The "real" shapes are what a 12.73 TiB disk turned out to
+# use, and what every earlier version of this suite missed by generating only
+# the layout the reader already expected.
+for LAYOUT in plain compressed real real-compressed; do
 echo
 echo "###### key store stored $LAYOUT ######"
-[ "$LAYOUT" = compressed ] && COMPRESS=--compress-plist || COMPRESS=
+case "$LAYOUT" in
+    plain)           COMPRESS=;                 SHAPE= ;;
+    compressed)      COMPRESS=--compress-plist; SHAPE= ;;
+    real)            COMPRESS=;                 SHAPE=--real-shape ;;
+    real-compressed) COMPRESS=--compress-plist; SHAPE=--real-shape ;;
+esac
 
 echo "== locking it behind a FileVault 2 password =="
 BUILD="$(python3 "$ROOT/tools/mkcorestorage.py" "$ENC" --password "$PASSWORD" \
-                 --from "$PLAIN" $COMPRESS)"
+                 --from "$PLAIN" $COMPRESS $SHAPE)"
 echo "$BUILD" | sed 's/^/   | /'
 KEY="$(echo "$BUILD" | awk '/volume key/ {print $4}')"
 

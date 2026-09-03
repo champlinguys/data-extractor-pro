@@ -30,7 +30,9 @@ Usage:
 
 import argparse
 import base64
+import itertools
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -126,7 +128,26 @@ def volume_header(pv_uuid, vg_uuid, key_data, volume_size, serial):
     return bytes(head)
 
 
-def volume_groups_block(serial, pv_uuid, vg_uuid):
+_OPENING_TAG = re.compile(r"<(dict|array|string|data|integer)(\s[^>]*?)?(/?)>")
+
+
+def attributed(xml):
+    """Rewrite opening tags to carry sequential ID attributes.
+
+    macOS writes the key store this way on real volumes - `<dict ID="0">`,
+    `<data ID="4">` - rather than the bare `<dict>` this generator otherwise
+    emits. A reader that matches the plain tag text finds nothing in one of the
+    two, so both shapes have to be generatable for the tests to mean anything.
+    """
+    counter = itertools.count()
+    def rewrite(match):
+        name, attrs, closing = match.group(1), match.group(2) or "", match.group(3)
+        return f'<{name}{attrs} ID="{next(counter)}"{closing}>'
+    return _OPENING_TAG.sub(rewrite, xml)
+
+
+def volume_groups_block(serial, pv_uuid, vg_uuid, transform=lambda x: x,
+                        descriptor_past_block=False):
     """The plaintext 0x0011 block: it says where the encrypted metadata is.
 
     The volume group plist that follows the descriptor is not something this
@@ -145,10 +166,19 @@ def volume_groups_block(serial, pv_uuid, vg_uuid):
         "\t</array>\n"
         "</dict>\n"
     )
-    body = bytearray(BLOCK_SIZE - BLOCK_HEADER)
+    xml = transform(xml)
+
+    # The descriptor and the plist are addressed from the block's start, and a
+    # real 12.73 TiB volume puts them at 8192 and 8240 - past the 8 KiB the
+    # block's checksum covers, in the block that follows. Both placements are
+    # legal and only one of them was ever generated here, which is why a reader
+    # that could only reach inside the block passed every test and still failed
+    # on the disk.
+    trailing = BLOCK_SIZE if descriptor_past_block else 0
+    body = bytearray(BLOCK_SIZE - BLOCK_HEADER + trailing)
     struct.pack_into("<I", body, 0, METADATA_SIZE)
-    descriptor = 512                                    # from the block's start
-    xml_offset = 1024                                   # likewise
+    descriptor = BLOCK_SIZE if descriptor_past_block else 512
+    xml_offset = BLOCK_SIZE + 48 if descriptor_past_block else 1024
     struct.pack_into("<I", body, 156, descriptor)
     struct.pack_into("<I", body, 160, xml_offset)
     struct.pack_into("<I", body, 184, 0)                # no entries follow
@@ -161,7 +191,10 @@ def volume_groups_block(serial, pv_uuid, vg_uuid):
     data = xml.encode() + b"\x00"
     at = xml_offset - BLOCK_HEADER
     body[at:at + len(data)] = data
-    return metadata_block(0x0011, bytes(body), serial)
+
+    # Only the block itself is checksummed; whatever trails it is written raw.
+    block = metadata_block(0x0011, bytes(body[:BLOCK_SIZE - BLOCK_HEADER]), serial)
+    return block + bytes(body[BLOCK_SIZE - BLOCK_HEADER:])
 
 
 def plist_block(serial, xml):
@@ -218,7 +251,7 @@ def compressed_plist_blocks(serial, xml, chunk_size=384):
     return blocks
 
 
-def family_uuid_block(serial, family_uuid):
+def family_uuid_block(serial, family_uuid, transform=lambda x: x):
     """A 0x001a block: the logical volume descriptor, family UUID and all."""
     xml = (
         "<dict>\n"
@@ -228,6 +261,7 @@ def family_uuid_block(serial, family_uuid):
         "\t<string>Macintosh HD</string>\n"
         "</dict>\n"
     )
+    xml = transform(xml)
     body = bytearray(BLOCK_SIZE - BLOCK_HEADER)
     data = xml.encode() + b"\x00"
     at = 96
@@ -239,7 +273,7 @@ def family_uuid_block(serial, family_uuid):
     return metadata_block(0x001A, bytes(body), serial)
 
 
-def encrypted_root_plist(password, volume_key):
+def encrypted_root_plist(password, volume_key, transform=lambda x: x):
     """Wrap the volume key for `password` the way macOS's key store does."""
     salt = os.urandom(16)
     kek = os.urandom(16)
@@ -264,7 +298,7 @@ def encrypted_root_plist(password, volume_key):
         lines = [text[i:i + 68] for i in range(0, len(text), 68)]
         return "\n".join("\t\t\t" + line for line in lines)
 
-    return (
+    return transform(
         "<dict>\n"
         "\t<key>ConversionInfo</key>\n"
         "\t<dict>\n"
@@ -313,6 +347,11 @@ def main():
     parser.add_argument("--compress-plist", action="store_true",
                         help="store the key store deflated across a chain of "
                              "metadata blocks, as a real volume tends to")
+    parser.add_argument("--real-shape", action="store_true",
+                        help="write the key store the way a real macOS volume "
+                             "does: plist tags carrying ID attributes, and the "
+                             "volume groups descriptor placed past the block "
+                             "its checksum covers")
     parser.add_argument("--from", dest="source", metavar="FS.img",
                         help="encrypt this filesystem image instead of making "
                              "an empty HFS+ one")
@@ -347,15 +386,18 @@ def main():
     image[0:SECTOR] = volume_header(pv_uuid.bytes, vg_uuid.bytes, key_data,
                                     total, serial)
 
-    plaintext_metadata = volume_groups_block(serial, pv_uuid, vg_uuid)
+    shape = attributed if args.real_shape else (lambda x: x)
+    plaintext_metadata = volume_groups_block(
+        serial, pv_uuid, vg_uuid, transform=shape,
+        descriptor_past_block=args.real_shape)
     for block in METADATA_BLOCKS:
         at = block * BLOCK_SIZE
-        image[at:at + BLOCK_SIZE] = plaintext_metadata
+        image[at:at + len(plaintext_metadata)] = plaintext_metadata
 
-    xml = encrypted_root_plist(args.password, volume_key)
+    xml = encrypted_root_plist(args.password, volume_key, transform=shape)
     blocks = (compressed_plist_blocks(serial, xml) if args.compress_plist
               else [plist_block(serial, xml)])
-    blocks.append(family_uuid_block(serial, family_uuid))
+    blocks.append(family_uuid_block(serial, family_uuid, transform=shape))
     for index, block in enumerate(blocks):
         at = (ENCRYPTED_METADATA_BLOCK + index) * BLOCK_SIZE
         image[at:at + BLOCK_SIZE] = xts_encrypt(metadata_key, pv_uuid.bytes,

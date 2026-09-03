@@ -15,6 +15,14 @@ constexpr size_t METADATA_BLOCK       = 8192;
 constexpr size_t BLOCK_HEADER         = 64;
 constexpr size_t BLOCK_TYPE_OFFSET    = 0x0A;
 
+// The volume groups block states where its descriptor is as an offset from the
+// block's own start, and that offset can land *past* the 8 KiB the checksum
+// covers - a 12.73 TiB disk puts it at exactly 8192, in the block that follows.
+// So the block is read with a second block's worth of room after it; only the
+// first METADATA_BLOCK bytes are checksummed, the rest is there to be pointed
+// into.
+constexpr size_t METADATA_WINDOW      = 2 * METADATA_BLOCK;
+
 // Block types we care about. 0x0011 is the plaintext block that says where the
 // encrypted metadata lives; 0x0019 carries the plist that holds the wrapped
 // keys, continued across 0x0024 blocks when it is compressed.
@@ -184,21 +192,47 @@ std::vector<uint8_t> base64Decode(const std::string& in) {
 // out of a document macOS wrote, and a scan cannot be tripped up by a construct
 // the parser does not know. Every blob found is checked for its own structure
 // before it is used, so a wrong match costs a failed unwrap, not a bad key.
+// Find the next `<name` that really starts a tag, i.e. one whose name ends
+// rather than merely begins there. CoreStorage writes these elements plain on
+// some volumes and with an ID attribute on others - `<dict ID="0">`,
+// `<data ID="4">` - so the '>' cannot be assumed to follow the name. Reports
+// where the tag ends and whether it closed itself.
+size_t findTagStart(const std::string& text, const std::string& name,
+                    size_t from, size_t* tagEnd, bool* selfClosing) {
+    while (from < text.size()) {
+        size_t at = text.find(name, from);
+        if (at == std::string::npos) return std::string::npos;
+        size_t after = at + name.size();
+        char next = after < text.size() ? text[after] : '\0';
+        if (next == '>' || next == '/' || next == ' ' || next == '\t' ||
+            next == '\n' || next == '\r') {
+            size_t close = text.find('>', after);
+            if (close == std::string::npos) return std::string::npos;
+            if (tagEnd) *tagEnd = close + 1;
+            if (selfClosing) *selfClosing = close > 0 && text[close - 1] == '/';
+            return at;
+        }
+        from = after;                       // "<dictionary", not "<dict"
+    }
+    return std::string::npos;
+}
+
 std::vector<std::vector<uint8_t>> plistDataForKey(const std::string& xml,
                                                   const std::string& key) {
     std::vector<std::vector<uint8_t>> found;
     const std::string tag = "<key>" + key + "</key>";
     for (size_t pos = xml.find(tag); pos != std::string::npos;
          pos = xml.find(tag, pos + tag.size())) {
-        size_t open = xml.find("<data>", pos);
-        if (open == std::string::npos) continue;
-        size_t close = xml.find("</data>", open);
+        size_t bodyStart = 0;
+        bool selfClosing = false;
+        size_t open = findTagStart(xml, "<data", pos, &bodyStart, &selfClosing);
+        if (open == std::string::npos || selfClosing) continue;
+        size_t close = xml.find("</data>", bodyStart);
         if (close == std::string::npos) continue;
         // Only take a <data> that belongs to this key: anything but whitespace
         // between the two means the key's own value was something else.
         if (xml.find_first_not_of(" \t\r\n", pos + tag.size()) != open) continue;
-        found.push_back(base64Decode(
-            xml.substr(open + 6, close - (open + 6))));
+        found.push_back(base64Decode(xml.substr(bodyStart, close - bodyStart)));
     }
     return found;
 }
@@ -208,11 +242,14 @@ std::optional<std::string> plistStringForKey(const std::string& xml,
     const std::string tag = "<key>" + key + "</key>";
     size_t pos = xml.find(tag);
     if (pos == std::string::npos) return std::nullopt;
-    size_t open = xml.find("<string>", pos);
+    size_t bodyStart = 0;
+    bool selfClosing = false;
+    size_t open = findTagStart(xml, "<string", pos, &bodyStart, &selfClosing);
     if (open == std::string::npos) return std::nullopt;
-    size_t close = xml.find("</string>", open);
+    if (selfClosing) return std::string();
+    size_t close = xml.find("</string>", bodyStart);
     if (close == std::string::npos) return std::nullopt;
-    return xml.substr(open + 8, close - (open + 8));
+    return xml.substr(bodyStart, close - bodyStart);
 }
 
 // "0123abcd-..." to 16 bytes in the order the UUID is written, which is the
@@ -238,22 +275,30 @@ bool parseUuid(const std::string& s, uint8_t out[16]) {
 // own markup is more robust than trusting a length field in a block header.
 void collectPlainPlists(const uint8_t* body, size_t bodySize,
                         std::vector<std::string>& out) {
-    static const std::string open = "<dict>";
+    static const std::string open = "<dict";
     static const std::string close = "</dict>";
     std::string text(reinterpret_cast<const char*>(body), bodySize);
     size_t pos = 0;
-    while ((pos = text.find(open, pos)) != std::string::npos) {
+    while (true) {
+        size_t tagEnd = 0;
+        bool selfClosing = false;
+        pos = findTagStart(text, open, pos, &tagEnd, &selfClosing);
+        if (pos == std::string::npos) break;
+        if (selfClosing) { pos = tagEnd; continue; }   // <dict/> holds nothing
+
         // Dictionaries nest - the crypto users are a list of them - so the
         // plist ends at the </dict> that closes this one, not the first.
-        size_t scan = pos + open.size();
+        size_t scan = tagEnd;
         size_t end = std::string::npos;
         for (int depth = 1; depth > 0; ) {
-            size_t nextOpen = text.find(open, scan);
+            size_t nestedEnd = 0;
+            bool nestedSelf = false;
+            size_t nextOpen = findTagStart(text, open, scan, &nestedEnd, &nestedSelf);
             size_t nextClose = text.find(close, scan);
             if (nextClose == std::string::npos) break;
             if (nextOpen != std::string::npos && nextOpen < nextClose) {
-                ++depth;
-                scan = nextOpen + open.size();
+                if (!nestedSelf) ++depth;
+                scan = nestedEnd;
             } else {
                 if (--depth == 0) end = nextClose;
                 scan = nextClose + close.size();
@@ -273,9 +318,10 @@ struct EncryptedMetadataLocation {
 };
 
 std::optional<EncryptedMetadataLocation>
-parseVolumeGroupsBlock(const uint8_t* block) {
+parseVolumeGroupsBlock(const uint8_t* block, size_t available) {
     const uint8_t* body = block + BLOCK_HEADER;
-    const size_t bodySize = METADATA_BLOCK - BLOCK_HEADER;
+    if (available < BLOCK_HEADER) return std::nullopt;
+    const size_t bodySize = available - BLOCK_HEADER;
 
     // The descriptor offset is measured from the start of the block, header
     // included; everything else here indexes the body.
@@ -311,13 +357,33 @@ std::vector<uint32_t> blockSizeCandidates(const VolumeHeader& header) {
     return sizes;
 }
 
+// The stride for a blind sweep: the smallest boundary a metadata block could be
+// placed on. Bounded below so a nonsense header cannot turn the sweep into a
+// byte-by-byte crawl of 256 MiB.
+uint64_t smallestBlockStep(const VolumeHeader& header) {
+    uint64_t step = METADATA_BLOCK;
+    for (uint32_t candidate : blockSizeCandidates(header))
+        if (candidate >= 512 && candidate < step) step = candidate;
+    return step;
+}
+
 // Read the block at `offset` and say whether it is a metadata block of `type`.
+// Reads a window rather than a single block, so a descriptor that points past
+// the checksummed block is still in memory; `available` reports how much of the
+// window the volume actually held, which is all a parse may index. The block
+// itself must be whole - only the room after it may be short, at the very end
+// of a volume.
 bool readMetadataBlock(ImageSource& pv, uint64_t offset, uint16_t type,
-                       std::vector<uint8_t>& block) {
+                       std::vector<uint8_t>& block, size_t* available) {
     if (offset + METADATA_BLOCK > pv.size()) return false;
-    if (pv.readAt(offset, block.data(), METADATA_BLOCK) != METADATA_BLOCK) return false;
+    size_t want = METADATA_WINDOW;
+    if (offset + want > pv.size()) want = static_cast<size_t>(pv.size() - offset);
+    size_t got = pv.readAt(offset, block.data(), want);
+    if (got < METADATA_BLOCK) return false;
     if (!metadataBlockValid(block.data())) return false;
-    return rd16(block.data() + BLOCK_TYPE_OFFSET) == type;
+    if (rd16(block.data() + BLOCK_TYPE_OFFSET) != type) return false;
+    if (available) *available = got;
+    return true;
 }
 
 // The plaintext block that describes the key store, with the block size that
@@ -332,16 +398,18 @@ struct VolumeGroups {
 std::optional<VolumeGroups> findVolumeGroups(ImageSource& pv,
                                              const VolumeHeader& header,
                                              std::string* diagnostic) {
-    std::vector<uint8_t> block(METADATA_BLOCK);
+    std::vector<uint8_t> block(METADATA_WINDOW);
+    size_t available = 0;
     uint64_t span = std::max<uint64_t>(header.metadataSize, METADATA_BLOCK * 8);
 
     for (uint32_t blockSize : blockSizeCandidates(header)) {
         for (uint64_t blockNumber : header.metadataBlocks) {
             uint64_t base = blockNumber * blockSize;
             for (uint64_t off = 0; off + METADATA_BLOCK <= span; off += METADATA_BLOCK) {
-                if (!readMetadataBlock(pv, base + off, TYPE_VOLUME_GROUPS, block))
+                if (!readMetadataBlock(pv, base + off, TYPE_VOLUME_GROUPS, block,
+                                       &available))
                     continue;
-                if (auto loc = parseVolumeGroupsBlock(block.data()))
+                if (auto loc = parseVolumeGroupsBlock(block.data(), available))
                     return VolumeGroups{*loc, blockSize};
             }
         }
@@ -352,10 +420,15 @@ std::optional<VolumeGroups> findVolumeGroups(ImageSource& pv,
     if (diagnostic)
         *diagnostic += "  the header's metadata block numbers led nowhere; "
                        "searched the volume instead\n";
+    // Step by the volume's own block size, not by the metadata block size: the
+    // blocks are 8 KiB but they are *placed* on block-number boundaries, so a
+    // sweep in 8 KiB strides steps straight over one sitting at, say, 4096.
+    uint64_t step = smallestBlockStep(header);
     uint64_t limit = std::min<uint64_t>(pv.size(), SEARCH_LIMIT);
-    for (uint64_t off = 0; off + METADATA_BLOCK <= limit; off += METADATA_BLOCK) {
-        if (!readMetadataBlock(pv, off, TYPE_VOLUME_GROUPS, block)) continue;
-        if (auto loc = parseVolumeGroupsBlock(block.data())) {
+    for (uint64_t off = 0; off + METADATA_BLOCK <= limit; off += step) {
+        if (!readMetadataBlock(pv, off, TYPE_VOLUME_GROUPS, block, &available))
+            continue;
+        if (auto loc = parseVolumeGroupsBlock(block.data(), available)) {
             // The block was found, so its own block number says what the
             // header's numbers are counted in.
             uint64_t number = rd64(block.data() + 32);
