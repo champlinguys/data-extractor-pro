@@ -26,6 +26,45 @@ constexpr uint16_t TYPE_PLIST_CONT    = 0x0024;
 // a corrupt size field must not turn into a multi-gigabyte read.
 constexpr uint64_t MAX_ENCRYPTED_METADATA = 64ull << 20;
 
+// How far into the volume to search when the header's own block numbers do not
+// lead anywhere. CoreStorage keeps its metadata near the front, so this is
+// generous; it only ever runs after the direct route has failed.
+constexpr uint64_t SEARCH_LIMIT = 256ull << 20;
+
+// The "weak CRC-32" CoreStorage stamps on every metadata block: CRC-32C, the
+// checksum stored at offset 0 over everything from offset 8 on.
+uint32_t weakCrc32(const uint8_t* data, size_t len, uint32_t crc) {
+    static uint32_t table[256];
+    static bool built = false;
+    if (!built) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int bit = 0; bit < 8; ++bit)
+                c = (c & 1) ? (0x82f63b78u ^ (c >> 1)) : (c >> 1);
+            table[i] = c;
+        }
+        built = true;
+    }
+    for (size_t i = 0; i < len; ++i)
+        crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    return crc;
+}
+
+// Is this 8 KiB really a CoreStorage metadata block? The checksum makes this a
+// near-certain test, which is what lets the block be *searched* for rather than
+// trusted to be where a header field says - and, once decrypted, what proves
+// the decryption key was right.
+bool metadataBlockValid(const uint8_t* block) {
+    // A block whose logical volume was wiped keeps its marker and drops the
+    // checksum; it is genuine metadata, just empty.
+    if (std::memcmp(block, "LVFwiped", 8) == 0) return true;
+    uint32_t initial = rd32(block + 4);
+    if (initial != 0xFFFFFFFFu) return false;
+    if (rd16(block + 8) != 1) return false;                 // format version
+    if (rd32(block + 48) != METADATA_BLOCK) return false;   // block size
+    return rd32(block) == weakCrc32(block + 8, METADATA_BLOCK - 8, initial);
+}
+
 // One AES-XTS data unit, decrypted in place. CoreStorage encrypts each metadata
 // block as a single 8 KiB unit, with the block's index as the tweak - unlike
 // the volume data, which is a unit per 512-byte sector.
@@ -226,14 +265,15 @@ void collectPlainPlists(const uint8_t* body, size_t bodySize,
     }
 }
 
-// Where the encrypted metadata lives, read out of the plaintext metadata.
+// Where the encrypted metadata lives, as the plaintext metadata states it:
+// block numbers, which still have to be turned into byte offsets.
 struct EncryptedMetadataLocation {
-    uint64_t offset = 0;
-    uint64_t size = 0;
+    uint64_t firstBlock = 0;
+    uint64_t blocks = 0;
 };
 
 std::optional<EncryptedMetadataLocation>
-parseVolumeGroupsBlock(const uint8_t* block, uint32_t blockSize) {
+parseVolumeGroupsBlock(const uint8_t* block) {
     const uint8_t* body = block + BLOCK_HEADER;
     const size_t bodySize = METADATA_BLOCK - BLOCK_HEADER;
 
@@ -244,19 +284,122 @@ parseVolumeGroupsBlock(const uint8_t* block, uint32_t blockSize) {
     vgd -= BLOCK_HEADER;
     if (vgd + 48 > bodySize) return std::nullopt;
 
-    uint64_t sizeInBlocks = rd64(body + vgd + 8);
-    uint64_t first        = rd64(body + vgd + 32);
+    uint64_t blocks = rd64(body + vgd + 8);
+    uint64_t first  = rd64(body + vgd + 32);
     // The top 16 bits are the physical volume this copy sits on. A logical
     // volume group can span several disks; we are looking at one of them, so
     // only a copy on this disk is reachable.
     if ((first >> 48) != 0) return std::nullopt;
     first &= 0x0000ffffffffffffull;
-    if (sizeInBlocks == 0 || first == 0) return std::nullopt;
+    if (blocks == 0 || first == 0) return std::nullopt;
+    return EncryptedMetadataLocation{first, blocks};
+}
 
-    EncryptedMetadataLocation loc;
-    loc.offset = first * blockSize;
-    loc.size   = sizeInBlocks * blockSize;
-    return loc;
+// Block numbers in the header are counted in units of the volume's block size.
+// That field has been read correctly off every volume seen so far, but the
+// whole key store hangs off it, so the sizes CoreStorage actually uses are
+// tried in turn and the one that lands on a real metadata block wins. Costs a
+// few reads and removes a single point of failure.
+std::vector<uint32_t> blockSizeCandidates(const VolumeHeader& header) {
+    std::vector<uint32_t> sizes;
+    for (uint32_t candidate : {header.metadataBlockSize, 8192u, 4096u, 512u,
+                               65536u, 16384u, 32768u}) {
+        if (candidate == 0) continue;
+        if (std::find(sizes.begin(), sizes.end(), candidate) == sizes.end())
+            sizes.push_back(candidate);
+    }
+    return sizes;
+}
+
+// Read the block at `offset` and say whether it is a metadata block of `type`.
+bool readMetadataBlock(ImageSource& pv, uint64_t offset, uint16_t type,
+                       std::vector<uint8_t>& block) {
+    if (offset + METADATA_BLOCK > pv.size()) return false;
+    if (pv.readAt(offset, block.data(), METADATA_BLOCK) != METADATA_BLOCK) return false;
+    if (!metadataBlockValid(block.data())) return false;
+    return rd16(block.data() + BLOCK_TYPE_OFFSET) == type;
+}
+
+// The plaintext block that describes the key store, with the block size that
+// found it. Tries where the header says first, then searches: a checksummed
+// 8 KiB block is distinctive enough to find on its own, and a volume whose
+// first metadata copy is damaged still has three more.
+struct VolumeGroups {
+    EncryptedMetadataLocation location;
+    uint32_t blockSize = 0;
+};
+
+std::optional<VolumeGroups> findVolumeGroups(ImageSource& pv,
+                                             const VolumeHeader& header,
+                                             std::string* diagnostic) {
+    std::vector<uint8_t> block(METADATA_BLOCK);
+    uint64_t span = std::max<uint64_t>(header.metadataSize, METADATA_BLOCK * 8);
+
+    for (uint32_t blockSize : blockSizeCandidates(header)) {
+        for (uint64_t blockNumber : header.metadataBlocks) {
+            uint64_t base = blockNumber * blockSize;
+            for (uint64_t off = 0; off + METADATA_BLOCK <= span; off += METADATA_BLOCK) {
+                if (!readMetadataBlock(pv, base + off, TYPE_VOLUME_GROUPS, block))
+                    continue;
+                if (auto loc = parseVolumeGroupsBlock(block.data()))
+                    return VolumeGroups{*loc, blockSize};
+            }
+        }
+    }
+
+    // Nothing where the header pointed. Sweep the front of the volume for the
+    // block itself; CoreStorage keeps its metadata there.
+    if (diagnostic)
+        *diagnostic += "  the header's metadata block numbers led nowhere; "
+                       "searched the volume instead\n";
+    uint64_t limit = std::min<uint64_t>(pv.size(), SEARCH_LIMIT);
+    for (uint64_t off = 0; off + METADATA_BLOCK <= limit; off += METADATA_BLOCK) {
+        if (!readMetadataBlock(pv, off, TYPE_VOLUME_GROUPS, block)) continue;
+        if (auto loc = parseVolumeGroupsBlock(block.data())) {
+            // The block was found, so its own block number says what the
+            // header's numbers are counted in.
+            uint64_t number = rd64(block.data() + 32);
+            uint32_t blockSize = number ? static_cast<uint32_t>(off / number)
+                                        : header.metadataBlockSize;
+            if (blockSize == 0) blockSize = METADATA_BLOCK;
+            return VolumeGroups{*loc, blockSize};
+        }
+    }
+    return std::nullopt;
+}
+
+// Where the encrypted metadata starts, in bytes. The location is stated in
+// block numbers, and a block number is only as good as the size it is scaled
+// by - so each candidate is *tested*, by decrypting its first block and asking
+// whether a real metadata block comes out. That check proves the offset and the
+// header's key data together.
+std::optional<uint64_t> locateEncryptedMetadata(ImageSource& pv,
+                                                const VolumeHeader& header,
+                                                const VolumeGroups& groups) {
+    std::vector<uint8_t> block(METADATA_BLOCK);
+    auto verify = [&](uint64_t offset) {
+        if (offset + METADATA_BLOCK > pv.size()) return false;
+        if (pv.readAt(offset, block.data(), METADATA_BLOCK) != METADATA_BLOCK) return false;
+        if (!xtsDecryptUnit(header.keyData, header.identifierBytes, 0,
+                            block.data(), METADATA_BLOCK))
+            return false;
+        return metadataBlockValid(block.data());
+    };
+
+    if (verify(groups.location.firstBlock * groups.blockSize))
+        return groups.location.firstBlock * groups.blockSize;
+    for (uint32_t blockSize : blockSizeCandidates(header)) {
+        uint64_t offset = groups.location.firstBlock * blockSize;
+        if (verify(offset)) return offset;
+    }
+
+    // Fall back to finding the region by decrypting for it. The first block of
+    // the region is the one encrypted with data unit 0, so a candidate that
+    // decrypts to a valid block is the region's start and nothing else.
+    uint64_t limit = std::min<uint64_t>(pv.size(), SEARCH_LIMIT);
+    for (uint64_t off = 0; off + METADATA_BLOCK <= limit; off += METADATA_BLOCK)
+        if (verify(off)) return off;
+    return std::nullopt;
 }
 
 } // namespace
@@ -264,39 +407,50 @@ parseVolumeGroupsBlock(const uint8_t* block, uint32_t blockSize) {
 std::optional<KeyMaterial> readKeyMaterial(ImageSource& pv,
                                            const VolumeHeader& header,
                                            std::string* note) {
-    if (header.metadataBlockSize == 0 || header.metadataSize < METADATA_BLOCK) {
-        if (note) *note = "CoreStorage header has no usable metadata description";
-        return std::nullopt;
-    }
-
-    // Find the plaintext block that points at the encrypted metadata. The
-    // header lists up to four copies of the metadata; any that reads is as good
-    // as another, so take the first that parses.
-    std::optional<EncryptedMetadataLocation> loc;
-    std::vector<uint8_t> block(METADATA_BLOCK);
-    for (uint64_t blockNumber : header.metadataBlocks) {
-        uint64_t base = blockNumber * header.metadataBlockSize;
-        for (uint64_t off = 0; off + METADATA_BLOCK <= header.metadataSize;
-             off += METADATA_BLOCK) {
-            if (pv.readAt(base + off, block.data(), METADATA_BLOCK) != METADATA_BLOCK)
-                break;
-            if (rd16(block.data() + BLOCK_TYPE_OFFSET) != TYPE_VOLUME_GROUPS) continue;
-            loc = parseVolumeGroupsBlock(block.data(), header.metadataBlockSize);
-            if (loc) break;
+    // A running account of what was tried, so a volume this fails on can say
+    // why rather than just "no". Only surfaced when the read fails.
+    std::string diagnostic;
+    auto fail = [&](const std::string& reason) {
+        if (note) {
+            *note = reason;
+            if (!diagnostic.empty()) *note += "\n" + diagnostic;
         }
-        if (loc) break;
-    }
-    if (!loc) {
-        if (note) *note = "could not find the CoreStorage metadata that describes "
-                          "the key store";
         return std::nullopt;
-    }
-    if (loc->size > MAX_ENCRYPTED_METADATA ||
-        loc->offset + loc->size > pv.size()) {
-        if (note) *note = "the CoreStorage metadata description is out of bounds "
-                          "for this volume";
-        return std::nullopt;
-    }
+    };
+
+    char line[160];
+    std::snprintf(line, sizeof line,
+                  "  block size %u, metadata %u bytes, %zu metadata copies\n",
+                  header.metadataBlockSize, header.metadataSize,
+                  header.metadataBlocks.size());
+    diagnostic += line;
+
+    auto groups = findVolumeGroups(pv, header, &diagnostic);
+    if (!groups)
+        return fail("could not find the CoreStorage metadata that describes the "
+                    "key store");
+    std::snprintf(line, sizeof line,
+                  "  key store described at block %llu (x%u), %llu blocks\n",
+                  (unsigned long long)groups->location.firstBlock,
+                  groups->blockSize,
+                  (unsigned long long)groups->location.blocks);
+    diagnostic += line;
+
+    auto offset = locateEncryptedMetadata(pv, header, *groups);
+    if (!offset)
+        return fail("the CoreStorage key store did not decrypt with the key in "
+                    "the volume header");
+    uint64_t size = std::min<uint64_t>(groups->location.blocks * groups->blockSize,
+                                       MAX_ENCRYPTED_METADATA);
+    if (size < METADATA_BLOCK || *offset + METADATA_BLOCK > pv.size())
+        return fail("the CoreStorage key store is out of bounds for this volume");
+    size = std::min<uint64_t>(size, pv.size() - *offset);
+    std::snprintf(line, sizeof line, "  key store at byte %llu, %llu bytes\n",
+                  (unsigned long long)*offset, (unsigned long long)size);
+    diagnostic += line;
+
+    const uint64_t regionOffset = *offset;
+    const uint64_t regionSize = size;
 
     KeyMaterial material;
     std::vector<uint8_t> compressed;    // a plist chained across several blocks
@@ -315,9 +469,10 @@ std::optional<KeyMaterial> readKeyMaterial(ImageSource& pv,
         compressedFilled = 0;
     };
 
-    const uint64_t blocks = loc->size / METADATA_BLOCK;
+    std::vector<uint8_t> block(METADATA_BLOCK);
+    const uint64_t blocks = regionSize / METADATA_BLOCK;
     for (uint64_t i = 0; i < blocks; ++i) {
-        if (pv.readAt(loc->offset + i * METADATA_BLOCK, block.data(),
+        if (pv.readAt(regionOffset + i * METADATA_BLOCK, block.data(),
                       METADATA_BLOCK) != METADATA_BLOCK)
             break;
         // The region is allocated whole and filled as the volume is used; the
@@ -375,10 +530,8 @@ std::optional<KeyMaterial> readKeyMaterial(ImageSource& pv,
         }
     }
 
-    if (material.plists.empty()) {
-        if (note) *note = "the CoreStorage metadata decrypted but held no key store";
-        return std::nullopt;
-    }
+    if (material.plists.empty())
+        return fail("the CoreStorage metadata decrypted but held no key store");
     return material;
 }
 
