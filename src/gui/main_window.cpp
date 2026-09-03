@@ -1004,12 +1004,44 @@ void MainWindow::collectExportRoots(QTreeWidgetItem* item,
 }
 
 namespace {
+// ext4/most Linux filesystems cap a path component at 255 *bytes*, not
+// characters - a name that looks short can still blow the limit once
+// multi-byte UTF-8 (CJK, emoji, ...) is counted. Leave headroom below that
+// for what the caller tacks on afterward: a " (N)" collision suffix and a
+// hash sidecar extension (".sha256" is the longest, 7 bytes).
+constexpr int kMaxNameBytes = 200;
+
+// Drop trailing Unicode code points (not UTF-16 code units, which would risk
+// slicing a surrogate pair in half) until the UTF-8 encoding fits maxBytes.
+QString truncateUtf8(const QString& s, int maxBytes) {
+    if (s.toUtf8().size() <= maxBytes) return s;
+    QVector<uint> cps = s.toUcs4();
+    while (!cps.isEmpty()) {
+        cps.removeLast();
+        QString candidate = QString::fromUcs4(cps.constData(), cps.size());
+        if (candidate.toUtf8().size() <= maxBytes) return candidate;
+    }
+    return QString();
+}
+
 QString sanitizeName(const QString& name) {
     QString s = name;
     s.replace('/', '_').replace('\\', '_');
     s.remove(QChar(0));
     if (s.isEmpty() || s == "." || s == "..") s = "_";
-    return s;
+    if (s.toUtf8().size() <= kMaxNameBytes) return s;
+
+    // Keep the extension intact when there plainly is one, so a truncated
+    // file still opens in whatever app expects that suffix.
+    int dot = s.lastIndexOf('.');
+    QString stem = s, ext;
+    if (dot > 0 && s.size() - dot <= 16) {
+        stem = s.left(dot);
+        ext = s.mid(dot);
+    }
+    stem = truncateUtf8(stem, kMaxNameBytes - ext.toUtf8().size());
+    if (stem.isEmpty()) stem = "_";
+    return stem + ext;
 }
 } // namespace
 
@@ -1062,8 +1094,12 @@ void MainWindow::exportWalk(Filesystem* fs, const FsNode& node, const QString& d
             std::lock_guard<std::mutex> lk(exportNameMutex_);
             exportName_ = safe.toStdString();
         }
-        // Name-collision policy.
-        if (std::filesystem::exists(outPath.toStdString())) {
+        // Name-collision policy. The error_code overloads matter here: a
+        // stat() failure that isn't ENOENT (e.g. ENAMETOOLONG on a name that
+        // dodged the truncation budget) must read as "doesn't exist yet",
+        // not throw filesystem_error and kill the whole export thread.
+        std::error_code existsEc;
+        if (std::filesystem::exists(outPath.toStdString(), existsEc)) {
             if (exportCollision_ == 2) return;                 // skip
             if (exportCollision_ == 0) {                       // rename: file (1), (2)...
                 QFileInfo fi(outPath);
@@ -1071,7 +1107,8 @@ void MainWindow::exportWalk(Filesystem* fs, const FsNode& node, const QString& d
                     QString cand = QDir(fi.path()).filePath(
                         fi.completeBaseName() + QString(" (%1)").arg(n) +
                         (fi.suffix().isEmpty() ? "" : "." + fi.suffix()));
-                    if (!std::filesystem::exists(cand.toStdString())) { outPath = cand; break; }
+                    std::error_code ec;
+                    if (!std::filesystem::exists(cand.toStdString(), ec)) { outPath = cand; break; }
                 }
             }
             // exportCollision_ == 1 (overwrite): fall through, truncating open.
@@ -1197,13 +1234,24 @@ void MainWindow::exportSelected() {
         exportUserCancelled_ = true;
     });
 
-    // Background worker: does all image I/O; never touches widgets.
+    // Background worker: does all image I/O; never touches widgets. An
+    // exception escaping a std::thread's function is std::terminate() - the
+    // whole app dies mid-export instead of just failing the one file - so
+    // this is the last line of defense behind exportWalk's own error_code
+    // use: any filesystem_error we didn't anticipate still gets counted as a
+    // failure instead of taking down a recovery job that may not be
+    // repeatable (source media on its way out, one-shot export window, ...).
     std::thread worker([this, jobs, destDir] {
-        for (const auto& j : jobs) {
-            // Fresh chain per root: two checked roots are independent walks.
-            std::vector<uint64_t> ancestors;
-            exportWalk(j.fs, j.node, destDir, ancestors, 0);
-            if (exportCancel_.load()) break;
+        try {
+            for (const auto& j : jobs) {
+                // Fresh chain per root: two checked roots are independent walks.
+                std::vector<uint64_t> ancestors;
+                exportWalk(j.fs, j.node, destDir, ancestors, 0);
+                if (exportCancel_.load()) break;
+            }
+        } catch (const std::exception&) {
+            ++exportFails_;
+            exportCancel_ = true;
         }
         exportDone_ = true;
     });
