@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -9,7 +10,7 @@
 
 namespace de {
 
-// FAT32, read-only.
+// FAT12/16/32, read-only.
 //
 // The filesystem every drive shipped with before exFAT existed, and still what
 // you find on cameras, car stereos, BIOS boot partitions, and any external disk
@@ -17,9 +18,19 @@ namespace de {
 // are exactly the ones that end up on this tool.
 //
 // Structurally it is exFAT's older sibling and the parser is shaped the same
-// way: a FAT of 32-bit (really 28-bit) cluster pointers, and directories made
-// of 32-byte entries. Nothing is held in memory but the boot parameters and the
-// volume label, so a 2 TB volume opens as fast as a 2 GB one.
+// way: a FAT of cluster pointers (32-bit, really 28-bit, on FAT32; 16-bit on
+// FAT16; packed 12-bit on FAT12), and directories made of 32-byte entries.
+// Nothing is held in memory but the boot parameters and the volume label, so a
+// 2 TB volume opens as fast as a 2 GB one.
+//
+// FAT12 and FAT16 are the same on-disk shape as FAT32 minus two things: the
+// cluster pointers are narrower, and the root directory is not a cluster chain
+// but a fixed-size region sitting between the FATs and the data area (no root
+// cluster, no FSInfo, no backup boot sector - none of those fields exist in a
+// pre-FAT32 BPB). fatBits_ selects the pointer width at mount, and root()/
+// listDir()/readVolumeMetadata() branch on whether the root has a cluster
+// (FAT32) or a fixed byte range (FAT12/16); everywhere else - the FAT walk via
+// fatNext(), subdirectory scanning, file reads - is identical across all three.
 //
 // The differences from exFAT that actually matter to a reader:
 //   - Names live in *two* places. Every file has a legacy 8.3 short name in its
@@ -50,8 +61,18 @@ public:
     // Returns nullptr if `vol` is not a FAT32 volume.
     static std::unique_ptr<FatFilesystem> open(std::shared_ptr<ImageSource> vol);
     static bool probe(ImageSource& vol);
+    // Cheap label for a FAT volume without mounting it: 12, 16, or 32, or 0 if
+    // `vol` is not a FAT volume at all. What detectFilesystemName() uses to
+    // pick "FAT12"/"FAT16"/"FAT32" without paying for a full mount.
+    static int probedFatBits(ImageSource& vol);
 
-    std::string typeName() const override { return "FAT32"; }
+    std::string typeName() const override {
+        switch (fatBits_) {
+            case 12: return "FAT12";
+            case 16: return "FAT16";
+            default: return "FAT32";
+        }
+    }
     FsNode root() override;
     std::vector<FsNode> listDir(const FsNode& dir) override;
     std::vector<uint8_t> readFile(const FsNode& file) override;
@@ -73,8 +94,9 @@ public:
         uint64_t clusterCount = 0;
         uint64_t usedClusters = 0;   // derived from FSInfo; advisory only
         uint8_t  fatCount = 1;
-        bool volumeDirty = false;    // clean-shutdown bit cleared in FAT[1]
-        bool mediaFailure = false;   // hard-error bit cleared in FAT[1]
+        uint8_t  fatBits = 32;       // 12, 16, or 32
+        bool volumeDirty = false;    // clean-shutdown bit cleared in FAT[1]; FAT12 has none
+        bool mediaFailure = false;   // hard-error bit cleared in FAT[1]; FAT12 has none
         bool usedBackupBootRegion = false;
     };
     const Stats& stats() const { return stats_; }
@@ -112,8 +134,16 @@ private:
     bool validCluster(uint32_t cluster) const;
 
     // -- FAT --
-    // Next cluster in the chain, masked to 28 bits, or 0 if the chain ends /
-    // the cluster is free / the entry is unusable.
+    // Read `n` bytes (1-4) at `byteOffset` within the FAT through the block
+    // cache, or nullopt if that range is unreadable or out of bounds. A FAT12
+    // entry can straddle a cache block boundary (the block size is a power of
+    // two, an entry is 1.5 bytes); that one case falls back to reading the
+    // volume directly instead of complicating the cache.
+    std::optional<uint32_t> fatReadRaw(uint64_t byteOffset, size_t n) const;
+    // Next cluster in the chain, or 0 if the chain ends / the cluster is free /
+    // the entry is unusable. Normalises FAT12/16's narrower special values
+    // (bad cluster, end-of-chain) to the FAT32 sentinels chainExtents already
+    // checks for, so everything downstream of this is width-agnostic.
     uint32_t fatNext(uint32_t cluster) const;
     // Walk `firstCluster` into coalesced byte extents covering `bytes`, using
     // the FAT unless `contiguous` says to read straight through.
@@ -133,6 +163,19 @@ private:
     // volume label entry's name (root directory only).
     std::vector<Record> scanDirectory(uint32_t firstCluster, bool contiguous,
                                       std::string* labelOut);
+    // FAT12/16 root: not a cluster chain, just a fixed byte range between the
+    // FATs and the data area. Reads it in one shot and runs it through the
+    // same per-entry logic as scanDirectory via scanEntries.
+    std::vector<Record> scanFixedRoot(std::string* labelOut);
+    // The per-entry body scanDirectory and scanFixedRoot both need: walk one
+    // buffer's worth of 32-byte directory entries, accumulating long-name
+    // fragments and appending finished Records to `out`. `lfn`, `pastEnd`, and
+    // `rejected` are the caller's running state, carried across calls so a
+    // long-name run can straddle a cluster boundary.
+    void scanEntries(const uint8_t* buf, size_t len, uint64_t chunkBase,
+                     std::vector<std::array<uint8_t, 32>>& lfn, bool& pastEnd,
+                     size_t& rejected, std::string* labelOut,
+                     std::vector<Record>& out);
 
     bool streamRecord(const Record& rec, const DataSink& sink);
     void note(const std::string& msg) const;
@@ -141,13 +184,16 @@ private:
     Stats stats_;
     std::string volName_;
 
+    int fatBits_ = 32;                 // 12, 16, or 32
     uint32_t bytesPerSector_ = 512;
     uint32_t clusterSize_ = 0;
     uint64_t fatByteOffset_ = 0;       // the active FAT
     uint64_t fatByteLength_ = 0;
     uint64_t dataByteOffset_ = 0;      // cluster 2 lives here
     uint32_t clusterCount_ = 0;
-    uint32_t rootCluster_ = 0;
+    uint32_t rootCluster_ = 0;         // FAT32 only
+    uint64_t rootDirByteOffset_ = 0;   // FAT12/16 only: the fixed root region
+    uint64_t rootDirBytes_ = 0;        // FAT12/16 only
     uint64_t volumeBytes_ = 0;
 
     // The active FAT, read in blocks: a multi-gigabyte file is thousands of

@@ -34,10 +34,23 @@ constexpr uint32_t MAX_LFN_ENTRIES = 20;   // 20 * 13 chars = 260 >= 255 + NUL
 constexpr size_t LFN_CHARS_PER_ENTRY = 13;
 
 // FAT32 entries are 28 bits; the top nibble is reserved and must be masked off
-// before comparing against any of these.
+// before comparing against any of these. fatNext() normalises FAT16's and
+// FAT12's own bad/end-of-chain values to FAT_BAD/FAT_EOF_MIN too, so every
+// caller past fatNext() - chainExtents, scanDirectory's chain walk - checks
+// against only these two regardless of the volume's actual FAT width.
 constexpr uint32_t FAT32_MASK = 0x0FFFFFFF;
 constexpr uint32_t FAT_BAD    = 0x0FFFFFF7;
 constexpr uint32_t FAT_EOF_MIN = 0x0FFFFFF8;  // >= this means end of chain
+
+constexpr uint32_t FAT16_BAD    = 0xFFF7;
+constexpr uint32_t FAT16_EOF_MIN = 0xFFF8;
+constexpr uint32_t FAT12_BAD    = 0x0FF7;
+constexpr uint32_t FAT12_EOF_MIN = 0x0FF8;
+
+// dirIdentity()'s stand-in for "the fixed root region" on FAT12/16, which has
+// no cluster of its own. Any real cluster number is far below this on a
+// volume narrow enough to be FAT12/16 in the first place.
+constexpr uint32_t ROOT_DIR_IDENTITY = 0xFFFFFFFFu;
 
 // Read the FAT in chunks this big rather than four bytes at a time.
 constexpr size_t FAT_BLOCK = 64 * 1024;
@@ -272,8 +285,8 @@ bool nameIsSafe(const std::string& s) {
 }
 
 // The BIOS parameter block, validated. Anything that fails these checks is not
-// a FAT32 volume - a damaged sector, a FAT16 volume, or a boot sector from some
-// other filesystem entirely.
+// a FAT volume at all - a damaged sector, or a boot sector from some other
+// filesystem entirely.
 struct Bpb {
     uint32_t bytesPerSector = 0;
     uint32_t sectorsPerCluster = 0;
@@ -281,12 +294,14 @@ struct Bpb {
     uint32_t numFats = 0;
     uint32_t fatSizeSectors = 0;
     uint64_t totalSectors = 0;
-    uint32_t rootCluster = 0;
-    uint32_t fsInfoSector = 0;
-    uint32_t backupBootSector = 0;
+    uint32_t rootCluster = 0;        // FAT32 only
+    uint32_t fsInfoSector = 0;       // FAT32 only
+    uint32_t backupBootSector = 0;   // FAT32 only
     uint32_t activeFat = 0;
     uint32_t clusterCount = 0;
     uint64_t dataStartSector = 0;
+    uint32_t rootDirSectors = 0;     // FAT12/16 only; 0 for FAT32
+    int fatBits = 32;
 };
 
 bool isPowerOfTwo(uint32_t v) { return v && (v & (v - 1)) == 0; }
@@ -307,12 +322,6 @@ std::optional<Bpb> parseBpb(const uint8_t* v) {
     uint8_t  media      = v[0x15];
     uint16_t fatSize16  = rd16(v + 0x16);
     uint32_t totSec32   = rd32(v + 0x20);
-    b.fatSizeSectors    = rd32(v + 0x24);
-    uint16_t extFlags   = rd16(v + 0x28);
-    uint16_t fsVersion  = rd16(v + 0x2A);
-    b.rootCluster       = rd32(v + 0x2C);
-    b.fsInfoSector      = rd16(v + 0x30);
-    b.backupBootSector  = rd16(v + 0x32);
 
     if (b.bytesPerSector < 512 || b.bytesPerSector > 4096 ||
         !isPowerOfTwo(b.bytesPerSector)) return std::nullopt;
@@ -321,38 +330,82 @@ std::optional<Bpb> parseBpb(const uint8_t* v) {
     if (b.reservedSectors == 0) return std::nullopt;
     if (b.numFats < 1 || b.numFats > 2) return std::nullopt;
     if (media != 0xF0 && media < 0xF8) return std::nullopt;
-    // The three fields FAT32 redefines: all must be zero, which is what tells a
-    // FAT32 BPB apart from the FAT12/FAT16 one it is an extension of.
-    if (rootEntries != 0 || totSec16 != 0 || fatSize16 != 0) return std::nullopt;
-    if (fsVersion != 0) return std::nullopt;     // no other version exists
-    if (b.fatSizeSectors == 0 || totSec32 == 0) return std::nullopt;
 
-    b.totalSectors = totSec32;
-    b.dataStartSector = static_cast<uint64_t>(b.reservedSectors) +
-                        static_cast<uint64_t>(b.numFats) * b.fatSizeSectors;
-    if (b.dataStartSector >= b.totalSectors) return std::nullopt;
-    uint64_t dataSectors = b.totalSectors - b.dataStartSector;
-    uint64_t clusters = dataSectors / b.sectorsPerCluster;
-    // Below this the volume is FAT16 or FAT12 by definition, whatever the BPB
-    // looks like: the cluster count alone is what picks the FAT width.
-    if (clusters < FAT32_MIN_CLUSTERS || clusters > FAT32_MASK - 1)
-        return std::nullopt;
-    b.clusterCount = static_cast<uint32_t>(clusters);
+    // The three fields FAT32 redefines are all zero on any pre-FAT32 BPB
+    // (rootEntries and fatSize16 are always nonzero there, since a FAT12/16
+    // volume needs a fixed root and cannot borrow FAT32's 32-bit FatSize
+    // field), so this is what tells the two BPB shapes apart.
+    bool isFat32 = (rootEntries == 0 && totSec16 == 0 && fatSize16 == 0);
 
-    if (b.rootCluster < 2 || b.rootCluster >= b.clusterCount + 2)
-        return std::nullopt;
-    // The FAT has to be big enough to describe every cluster, plus its two
-    // reserved entries. A stale backup boot sector from a smaller former volume
-    // is caught here rather than by reads running off the end of the FAT.
-    uint64_t fatBytes = static_cast<uint64_t>(b.fatSizeSectors) * b.bytesPerSector;
-    if (fatBytes < (static_cast<uint64_t>(b.clusterCount) + 2) * 4)
-        return std::nullopt;
+    if (isFat32) {
+        uint32_t fatSize32  = rd32(v + 0x24);
+        uint16_t extFlags   = rd16(v + 0x28);
+        uint16_t fsVersion  = rd16(v + 0x2A);
+        b.rootCluster       = rd32(v + 0x2C);
+        b.fsInfoSector      = rd16(v + 0x30);
+        b.backupBootSector  = rd16(v + 0x32);
+        b.fatSizeSectors    = fatSize32;
 
-    // Bit 7 of ExtFlags means the FATs are not mirrored, and the low nibble
-    // then says which one is live. With mirroring on, both are identical.
-    b.activeFat = 0;
-    if ((extFlags & 0x0080) && b.numFats == 2) b.activeFat = extFlags & 0x000F;
-    if (b.activeFat >= b.numFats) b.activeFat = 0;
+        if (fsVersion != 0) return std::nullopt;     // no other version exists
+        if (b.fatSizeSectors == 0 || totSec32 == 0) return std::nullopt;
+
+        b.totalSectors = totSec32;
+        b.dataStartSector = static_cast<uint64_t>(b.reservedSectors) +
+                            static_cast<uint64_t>(b.numFats) * b.fatSizeSectors;
+        if (b.dataStartSector >= b.totalSectors) return std::nullopt;
+        uint64_t dataSectors = b.totalSectors - b.dataStartSector;
+        uint64_t clusters = dataSectors / b.sectorsPerCluster;
+        // Below this the volume is FAT16 or FAT12 by definition, whatever the
+        // BPB looks like: the cluster count alone is what picks the FAT width.
+        if (clusters < FAT32_MIN_CLUSTERS || clusters > FAT32_MASK - 1)
+            return std::nullopt;
+        b.clusterCount = static_cast<uint32_t>(clusters);
+
+        if (b.rootCluster < 2 || b.rootCluster >= b.clusterCount + 2)
+            return std::nullopt;
+        // The FAT has to be big enough to describe every cluster, plus its two
+        // reserved entries. A stale backup boot sector from a smaller former
+        // volume is caught here rather than by reads running off the end of
+        // the FAT.
+        uint64_t fatBytes = static_cast<uint64_t>(b.fatSizeSectors) * b.bytesPerSector;
+        if (fatBytes < (static_cast<uint64_t>(b.clusterCount) + 2) * 4)
+            return std::nullopt;
+
+        // Bit 7 of ExtFlags means the FATs are not mirrored, and the low
+        // nibble then says which one is live. With mirroring on, both are
+        // identical.
+        b.activeFat = 0;
+        if ((extFlags & 0x0080) && b.numFats == 2) b.activeFat = extFlags & 0x000F;
+        if (b.activeFat >= b.numFats) b.activeFat = 0;
+        b.fatBits = 32;
+    } else {
+        // FAT12/16: no FSInfo, no backup boot sector, and the root directory
+        // is a fixed number of sectors sitting right after the FATs rather
+        // than a cluster chain in the data area.
+        if (rootEntries == 0 || fatSize16 == 0) return std::nullopt;
+        b.fatSizeSectors = fatSize16;
+        b.totalSectors = totSec16 != 0 ? totSec16 : totSec32;
+        if (b.totalSectors == 0) return std::nullopt;
+
+        b.rootDirSectors = (static_cast<uint32_t>(rootEntries) * ENTRY_SIZE +
+                            b.bytesPerSector - 1) / b.bytesPerSector;
+        b.dataStartSector = static_cast<uint64_t>(b.reservedSectors) +
+                            static_cast<uint64_t>(b.numFats) * b.fatSizeSectors +
+                            b.rootDirSectors;
+        if (b.dataStartSector >= b.totalSectors) return std::nullopt;
+        uint64_t dataSectors = b.totalSectors - b.dataStartSector;
+        uint64_t clusters = dataSectors / b.sectorsPerCluster;
+        if (clusters == 0 || clusters >= FAT32_MIN_CLUSTERS) return std::nullopt;
+        b.clusterCount = static_cast<uint32_t>(clusters);
+        // The spec's own dividing line between the two narrow widths.
+        b.fatBits = (clusters < 4085) ? 12 : 16;
+
+        uint64_t fatBits64 = (static_cast<uint64_t>(b.clusterCount) + 2) *
+                             static_cast<uint64_t>(b.fatBits);
+        uint64_t fatBytes = static_cast<uint64_t>(b.fatSizeSectors) * b.bytesPerSector;
+        if (fatBytes * 8 < fatBits64) return std::nullopt;
+        b.activeFat = 0;   // FAT12/16 has no ExtFlags field; the FATs mirror
+    }
     return b;
 }
 
@@ -376,10 +429,20 @@ bool FatFilesystem::probe(ImageSource& vol) {
     if (vol.readAt(0, vbr, sizeof vbr) == sizeof vbr && parseBpb(vbr))
         return true;
     // The primary may be unreadable; the backup normally sits at sector 6, but
-    // that is only knowable from the primary, so try the standard location.
-    if (vol.readAt(6ull * 512, vbr, sizeof vbr) == sizeof vbr && parseBpb(vbr))
-        return true;
+    // that only exists for FAT32, and is only knowable from the primary, so
+    // this tries the standard location and lets parseBpb reject anything else.
+    if (vol.readAt(6ull * 512, vbr, sizeof vbr) == sizeof vbr) {
+        auto bpb = parseBpb(vbr);
+        if (bpb && bpb->fatBits == 32) return true;
+    }
     return false;
+}
+
+int FatFilesystem::probedFatBits(ImageSource& vol) {
+    uint8_t vbr[512] = {};
+    if (vol.readAt(0, vbr, sizeof vbr) != sizeof vbr) return 0;
+    auto bpb = parseBpb(vbr);
+    return bpb ? bpb->fatBits : 0;
 }
 
 std::unique_ptr<FatFilesystem> FatFilesystem::open(std::shared_ptr<ImageSource> vol) {
@@ -408,13 +471,23 @@ bool FatFilesystem::mount(bool fromBackup) {
     if (vol_->readAt(vbrOff, v, sizeof v) < sizeof v) return false;
     auto bpb = parseBpb(v);
     if (!bpb) return false;
+    // A backup boot sector is a FAT32 concept; trying one against a FAT12/16
+    // volume would mount whatever sector 6 happens to be as if it were a BPB.
+    if (fromBackup && bpb->fatBits != 32) return false;
 
+    fatBits_ = bpb->fatBits;
     bytesPerSector_ = bpb->bytesPerSector;
     clusterSize_ = bpb->bytesPerSector * bpb->sectorsPerCluster;
     clusterCount_ = bpb->clusterCount;
     rootCluster_ = bpb->rootCluster;
     volumeBytes_ = bpb->totalSectors * bpb->bytesPerSector;
     dataByteOffset_ = bpb->dataStartSector * bpb->bytesPerSector;
+    // FAT12/16 only: the fixed root sits right before the data area, i.e.
+    // right after the FATs.
+    rootDirByteOffset_ = (static_cast<uint64_t>(bpb->reservedSectors) +
+                         static_cast<uint64_t>(bpb->numFats) * bpb->fatSizeSectors) *
+                        bpb->bytesPerSector;
+    rootDirBytes_ = static_cast<uint64_t>(bpb->rootDirSectors) * bpb->bytesPerSector;
 
     fatByteOffset_ = (static_cast<uint64_t>(bpb->reservedSectors) +
                       static_cast<uint64_t>(bpb->activeFat) * bpb->fatSizeSectors) *
@@ -436,18 +509,33 @@ bool FatFilesystem::mount(bool fromBackup) {
     stats_.clusterSize = clusterSize_;
     stats_.clusterCount = clusterCount_;
     stats_.fatCount = static_cast<uint8_t>(bpb->numFats);
+    stats_.fatBits = static_cast<uint8_t>(fatBits_);
 
-    // FAT[1] carries two status bits in its top nibble, both active-low: bit 27
-    // is "was cleanly unmounted" and bit 26 is "no hard error was seen". They
-    // are the only dirty-volume signal FAT32 has.
-    uint8_t fat1[8] = {};
-    if (vol_->readAt(fatByteOffset_, fat1, sizeof fat1) == sizeof fat1) {
-        uint32_t e1 = rd32(fat1 + 4);
-        // Only meaningful if FAT[0] holds the media descriptor it should; on a
-        // damaged FAT these bits would otherwise read as alarming nonsense.
-        if ((rd32(fat1) & FAT32_MASK) >= 0x0FFFFF00) {
-            stats_.volumeDirty  = (e1 & 0x08000000) == 0;
-            stats_.mediaFailure = (e1 & 0x04000000) == 0;
+    // FAT[1] carries two status bits, both active-low, in the top of its entry:
+    // "was cleanly unmounted" and "no hard error was seen". FAT32 keeps them in
+    // bits 27/26 of its 28-bit entry; FAT16 keeps the same two bits at the top
+    // of its 16-bit entry. FAT12's entry is too narrow to spare any bits for
+    // this, so it has no dirty-volume signal at all.
+    if (fatBits_ == 32) {
+        uint8_t fat1[8] = {};
+        if (vol_->readAt(fatByteOffset_, fat1, sizeof fat1) == sizeof fat1) {
+            uint32_t e1 = rd32(fat1 + 4);
+            // Only meaningful if FAT[0] holds the media descriptor it should;
+            // on a damaged FAT these bits would otherwise read as nonsense.
+            if ((rd32(fat1) & FAT32_MASK) >= 0x0FFFFF00) {
+                stats_.volumeDirty  = (e1 & 0x08000000) == 0;
+                stats_.mediaFailure = (e1 & 0x04000000) == 0;
+            }
+        }
+    } else if (fatBits_ == 16) {
+        uint8_t fat1[4] = {};
+        if (vol_->readAt(fatByteOffset_, fat1, sizeof fat1) == sizeof fat1) {
+            uint16_t e0 = rd16(fat1);
+            uint16_t e1 = rd16(fat1 + 2);
+            if (e0 >= 0xFF00) {
+                stats_.volumeDirty  = (e1 & 0x8000) == 0;
+                stats_.mediaFailure = (e1 & 0x4000) == 0;
+            }
         }
     }
     if (stats_.volumeDirty)
@@ -457,9 +545,9 @@ bool FatFilesystem::mount(bool fromBackup) {
         note("Volume flagged with a media failure: the last driver to write it "
              "hit sectors it could not read.");
 
-    note("FAT32 timestamps are stored in local time with no record of the time "
-         "zone, so they are read as UTC. Dates may be off by the original "
-         "machine's UTC offset.");
+    note(typeName() + " timestamps are stored in local time with no record of "
+         "the time zone, so they are read as UTC. Dates may be off by the "
+         "original machine's UTC offset.");
 
     readVolumeMetadata(bpb->fsInfoSector);
     return true;
@@ -469,7 +557,14 @@ void FatFilesystem::readVolumeMetadata(uint32_t fsInfoSector) {
     // The volume label lives in the root directory as an entry with the
     // volume-id attribute. It is also in the BPB at offset 0x47, but that copy
     // goes stale the moment the volume is renamed, so the directory wins.
-    scanDirectory(rootCluster_, false, &volName_);
+    if (fatBits_ == 32) {
+        scanDirectory(rootCluster_, false, &volName_);
+    } else {
+        scanFixedRoot(&volName_);
+    }
+
+    // FSInfo is a FAT32-only structure; FAT12/16 has no allocation hint at all.
+    if (fatBits_ != 32) return;
 
     // FAT32 has no allocation bitmap; FSInfo caches the free cluster count so a
     // driver does not have to sum the whole FAT at mount. It is a hint, not a
@@ -488,13 +583,11 @@ void FatFilesystem::readVolumeMetadata(uint32_t fsInfoSector) {
 
 // ------------------------------------------------------------------- FAT ----
 
-uint32_t FatFilesystem::fatNext(uint32_t cluster) const {
-    if (!validCluster(cluster)) return 0;
-    uint64_t off = fatByteOffset_ + static_cast<uint64_t>(cluster) * 4;
-    if (off + 4 > fatByteOffset_ + fatByteLength_) return 0;
+std::optional<uint32_t> FatFilesystem::fatReadRaw(uint64_t byteOffset, size_t n) const {
+    if (byteOffset + n > fatByteOffset_ + fatByteLength_) return std::nullopt;
 
     std::lock_guard<std::mutex> lock(fatMutex_);
-    uint64_t blockStart = off & ~static_cast<uint64_t>(FAT_BLOCK - 1);
+    uint64_t blockStart = byteOffset & ~static_cast<uint64_t>(FAT_BLOCK - 1);
     if (!fatBlockValid_ || blockStart != fatBlockStart_) {
         size_t want = static_cast<size_t>(
             std::min<uint64_t>(FAT_BLOCK,
@@ -508,9 +601,49 @@ uint32_t FatFilesystem::fatNext(uint32_t cluster) const {
         fatBlockStart_ = blockStart;
         fatBlockValid_ = true;
     }
-    size_t idx = static_cast<size_t>(off - blockStart);
-    if (idx + 4 > fatBlock_.size()) return 0;
-    return rd32(fatBlock_.data() + idx) & FAT32_MASK;
+    size_t idx = static_cast<size_t>(byteOffset - blockStart);
+    if (idx + n <= fatBlock_.size()) {
+        uint32_t v = 0;
+        for (size_t i = 0; i < n; ++i)
+            v |= static_cast<uint32_t>(fatBlock_[idx + i]) << (8 * i);
+        return v;
+    }
+    // A FAT12 entry can straddle the cache block boundary (FAT_BLOCK is a
+    // power of two; an entry is 1.5 bytes). Rare enough not to be worth
+    // reshaping the cache for - read those two bytes directly instead.
+    uint8_t tmp[4] = {};
+    if (vol_->readAt(byteOffset, tmp, n) < n) return std::nullopt;
+    uint32_t v = 0;
+    for (size_t i = 0; i < n; ++i) v |= static_cast<uint32_t>(tmp[i]) << (8 * i);
+    return v;
+}
+
+uint32_t FatFilesystem::fatNext(uint32_t cluster) const {
+    if (!validCluster(cluster)) return 0;
+
+    if (fatBits_ == 32) {
+        auto v = fatReadRaw(fatByteOffset_ + static_cast<uint64_t>(cluster) * 4, 4);
+        return v ? (*v & FAT32_MASK) : 0;
+    }
+    if (fatBits_ == 16) {
+        auto v = fatReadRaw(fatByteOffset_ + static_cast<uint64_t>(cluster) * 2, 2);
+        if (!v) return 0;
+        uint32_t e = *v & 0xFFFF;
+        if (e == 0) return 0;
+        if (e == FAT16_BAD) return FAT_BAD;
+        if (e >= FAT16_EOF_MIN) return FAT_EOF_MIN;
+        return e;
+    }
+    // FAT12: entries are packed 3 bytes per 2 clusters - even clusters take the
+    // low 12 bits of the pair, odd clusters the high 12.
+    uint64_t byteOff = fatByteOffset_ + (static_cast<uint64_t>(cluster) * 3) / 2;
+    auto v = fatReadRaw(byteOff, 2);
+    if (!v) return 0;
+    uint32_t e = (cluster & 1) ? (*v >> 4) : (*v & 0x0FFF);
+    if (e == 0) return 0;
+    if (e == FAT12_BAD) return FAT_BAD;
+    if (e >= FAT12_EOF_MIN) return FAT_EOF_MIN;
+    return e;
 }
 
 std::vector<FatFilesystem::Extent> FatFilesystem::chainExtents(
@@ -567,7 +700,11 @@ std::vector<FatFilesystem::Extent> FatFilesystem::chainExtents(
 
 std::optional<FatFilesystem::Record> FatFilesystem::recordAt(uint64_t entryOffset) const {
     uint8_t e[ENTRY_SIZE] = {};
-    if (entryOffset < dataByteOffset_) return std::nullopt;
+    // A live entry lives at or after the data area on every width - except a
+    // FAT12/16 entry sitting directly in the root, which lives in the fixed
+    // region just before it.
+    uint64_t minOffset = (fatBits_ != 32) ? rootDirByteOffset_ : dataByteOffset_;
+    if (entryOffset < minOffset) return std::nullopt;
     if (vol_->readAt(entryOffset, e, sizeof e) < sizeof e) return std::nullopt;
 
     uint8_t first = e[0];
@@ -595,6 +732,127 @@ std::optional<FatFilesystem::Record> FatFilesystem::recordAt(uint64_t entryOffse
     if (rec.size > volumeBytes_) return std::nullopt;
     if (rec.size > 0 && !validCluster(rec.firstCluster)) return std::nullopt;
     return rec;
+}
+
+void FatFilesystem::scanEntries(const uint8_t* buf, size_t len, uint64_t chunkBase,
+                                std::vector<std::array<uint8_t, 32>>& lfn,
+                                bool& pastEnd, size_t& rejected,
+                                std::string* labelOut, std::vector<Record>& out) {
+    for (size_t i = 0; i + ENTRY_SIZE <= len; i += ENTRY_SIZE) {
+        const uint8_t* e = buf + i;
+        uint8_t first = e[0];
+        uint8_t attr = e[11];
+
+        if (first == DIR_END) {
+            // Everything from here on is free space. It is worth reading
+            // anyway - that is where a deleted file most often survives -
+            // but nothing past this point is a live entry.
+            pastEnd = true;
+            lfn.clear();
+            continue;
+        }
+        if (attr & ATTR_RESERVED) { lfn.clear(); ++rejected; continue; }
+        if (isDotEntry(e)) { lfn.clear(); continue; }
+
+        if (attr == ATTR_LONG_NAME) {
+            if (lfn.size() >= MAX_LFN_ENTRIES) lfn.clear();
+            std::array<uint8_t, ENTRY_SIZE> a{};
+            std::memcpy(a.data(), e, ENTRY_SIZE);
+            lfn.push_back(a);
+            continue;
+        }
+
+        // A volume-label entry: the root's, which names the volume, or a
+        // stray one in a subdirectory, which names nothing.
+        if (attr & ATTR_VOLUME_ID) {
+            if (labelOut && labelOut->empty() && first != DIR_FREE && !pastEnd) {
+                std::string label;
+                if (decodeLabel(e, label)) *labelOut = label;
+            }
+            lfn.clear();
+            continue;
+        }
+
+        bool deleted = (first == DIR_FREE) || pastEnd;
+
+        // Tie the accumulated long-name entries to this short entry. Every
+        // one of them must carry the same checksum, and that checksum must
+        // match the short name - which is what stops a long name from being
+        // grafted onto the unrelated entry that happens to follow it.
+        std::string longName;
+        if (!lfn.empty()) {
+            uint8_t cs = lfn[0][13];
+            bool consistent = true;
+            for (const auto& l : lfn)
+                if (l[13] != cs) { consistent = false; break; }
+            if (consistent) {
+                uint8_t nameFirst = first;
+                if (first == DIR_FREE) {
+                    // The original first byte is gone, but the checksum is
+                    // invertible and hands it straight back.
+                    nameFirst = recoverDeletedFirstByte(cs, e);
+                }
+                uint8_t probe[11];
+                std::memcpy(probe, e, 11);
+                probe[0] = nameFirst;
+                if (shortNameChecksum(probe) == cs) {
+                    std::vector<uint16_t> units;
+                    units.reserve(lfn.size() * LFN_CHARS_PER_ENTRY);
+                    // Stored in reverse order: walk back to read forwards.
+                    for (auto it = lfn.rbegin(); it != lfn.rend(); ++it) {
+                        const uint8_t* l = it->data();
+                        for (size_t k = 0; k < 5; ++k)  units.push_back(rd16(l + 1 + k * 2));
+                        for (size_t k = 0; k < 6; ++k)  units.push_back(rd16(l + 14 + k * 2));
+                        for (size_t k = 0; k < 2; ++k)  units.push_back(rd16(l + 28 + k * 2));
+                    }
+                    // Padded with 0xFFFF and terminated with 0x0000.
+                    auto end = std::find_if(units.begin(), units.end(),
+                        [](uint16_t u) { return u == 0x0000 || u == 0xFFFF; });
+                    units.erase(end, units.end());
+                    longName = utf16leToUtf8(units);
+                }
+            }
+        }
+        lfn.clear();
+
+        Record rec;
+        rec.entryOffset = chunkBase + i;
+        rec.isDeleted = deleted;
+        // A deleted entry's chain has been freed and the FAT now describes
+        // whatever was allocated over it, so following it would read another
+        // file's data. Reading straight through is the standard guess.
+        rec.contiguous = deleted;
+        rec.isDir = (attr & ATTR_DIRECTORY) != 0;
+        rec.size = rec.isDir ? 0 : rd32(e + 28);
+        rec.firstCluster = (static_cast<uint32_t>(rd16(e + 20)) << 16) | rd16(e + 26);
+        rec.times.crtime = fatTimeToUnixNs(rd16(e + 16), rd16(e + 14), e[13]);
+        rec.times.mtime  = fatTimeToUnixNs(rd16(e + 24), rd16(e + 22));
+        rec.times.atime  = fatTimeToUnixNs(rd16(e + 18), 0);
+
+        std::string shortName;
+        uint8_t nameFirst = first;
+        if (first == DIR_FREE) nameFirst = '_';   // unrecoverable without a long name
+        bool shortOk = decodeShortName(e, first == DIR_FREE, nameFirst, shortName);
+
+        if (!longName.empty() && nameIsSafe(longName)) {
+            rec.name = longName;
+        } else if (shortOk && nameIsSafe(shortName)) {
+            rec.name = shortName;
+        } else {
+            // Neither name survived: the slot is not really a directory
+            // entry, or it is too damaged to name safely.
+            ++rejected;
+            continue;
+        }
+
+        // A stale slot can hold anything. These two are what keep debris out
+        // of the listing without discarding genuinely recoverable files.
+        if (rec.size > volumeBytes_) { ++rejected; continue; }
+        if (rec.size > 0 && !validCluster(rec.firstCluster)) { ++rejected; continue; }
+        if (rec.isDir && !validCluster(rec.firstCluster)) { ++rejected; continue; }
+
+        out.push_back(std::move(rec));
+    }
 }
 
 std::vector<FatFilesystem::Record> FatFilesystem::scanDirectory(
@@ -626,123 +884,8 @@ std::vector<FatFilesystem::Record> FatFilesystem::scanDirectory(
                  "folder are missing.");
             break;
         }
-        uint64_t clusterBase = clusterToOffset(cluster);
-
-        for (size_t i = 0; i + ENTRY_SIZE <= got; i += ENTRY_SIZE) {
-            const uint8_t* e = buf.data() + i;
-            uint8_t first = e[0];
-            uint8_t attr = e[11];
-
-            if (first == DIR_END) {
-                // Everything from here on is free space. It is worth reading
-                // anyway - that is where a deleted file most often survives -
-                // but nothing past this point is a live entry.
-                pastEnd = true;
-                lfn.clear();
-                continue;
-            }
-            if (attr & ATTR_RESERVED) { lfn.clear(); ++rejected; continue; }
-            if (isDotEntry(e)) { lfn.clear(); continue; }
-
-            if (attr == ATTR_LONG_NAME) {
-                if (lfn.size() >= MAX_LFN_ENTRIES) lfn.clear();
-                std::array<uint8_t, ENTRY_SIZE> a{};
-                std::memcpy(a.data(), e, ENTRY_SIZE);
-                lfn.push_back(a);
-                continue;
-            }
-
-            // A volume-label entry: the root's, which names the volume, or a
-            // stray one in a subdirectory, which names nothing.
-            if (attr & ATTR_VOLUME_ID) {
-                if (labelOut && labelOut->empty() && first != DIR_FREE && !pastEnd) {
-                    std::string label;
-                    if (decodeLabel(e, label)) *labelOut = label;
-                }
-                lfn.clear();
-                continue;
-            }
-
-            bool deleted = (first == DIR_FREE) || pastEnd;
-
-            // Tie the accumulated long-name entries to this short entry. Every
-            // one of them must carry the same checksum, and that checksum must
-            // match the short name - which is what stops a long name from being
-            // grafted onto the unrelated entry that happens to follow it.
-            std::string longName;
-            if (!lfn.empty()) {
-                uint8_t cs = lfn[0][13];
-                bool consistent = true;
-                for (const auto& l : lfn)
-                    if (l[13] != cs) { consistent = false; break; }
-                if (consistent) {
-                    uint8_t nameFirst = first;
-                    if (first == DIR_FREE) {
-                        // The original first byte is gone, but the checksum is
-                        // invertible and hands it straight back.
-                        nameFirst = recoverDeletedFirstByte(cs, e);
-                    }
-                    uint8_t probe[11];
-                    std::memcpy(probe, e, 11);
-                    probe[0] = nameFirst;
-                    if (shortNameChecksum(probe) == cs) {
-                        std::vector<uint16_t> units;
-                        units.reserve(lfn.size() * LFN_CHARS_PER_ENTRY);
-                        // Stored in reverse order: walk back to read forwards.
-                        for (auto it = lfn.rbegin(); it != lfn.rend(); ++it) {
-                            const uint8_t* l = it->data();
-                            for (size_t k = 0; k < 5; ++k)  units.push_back(rd16(l + 1 + k * 2));
-                            for (size_t k = 0; k < 6; ++k)  units.push_back(rd16(l + 14 + k * 2));
-                            for (size_t k = 0; k < 2; ++k)  units.push_back(rd16(l + 28 + k * 2));
-                        }
-                        // Padded with 0xFFFF and terminated with 0x0000.
-                        auto end = std::find_if(units.begin(), units.end(),
-                            [](uint16_t u) { return u == 0x0000 || u == 0xFFFF; });
-                        units.erase(end, units.end());
-                        longName = utf16leToUtf8(units);
-                    }
-                }
-            }
-            lfn.clear();
-
-            Record rec;
-            rec.entryOffset = clusterBase + i;
-            rec.isDeleted = deleted;
-            // A deleted entry's chain has been freed and the FAT now describes
-            // whatever was allocated over it, so following it would read another
-            // file's data. Reading straight through is the standard guess.
-            rec.contiguous = deleted;
-            rec.isDir = (attr & ATTR_DIRECTORY) != 0;
-            rec.size = rec.isDir ? 0 : rd32(e + 28);
-            rec.firstCluster = (static_cast<uint32_t>(rd16(e + 20)) << 16) | rd16(e + 26);
-            rec.times.crtime = fatTimeToUnixNs(rd16(e + 16), rd16(e + 14), e[13]);
-            rec.times.mtime  = fatTimeToUnixNs(rd16(e + 24), rd16(e + 22));
-            rec.times.atime  = fatTimeToUnixNs(rd16(e + 18), 0);
-
-            std::string shortName;
-            uint8_t nameFirst = first;
-            if (first == DIR_FREE) nameFirst = '_';   // unrecoverable without a long name
-            bool shortOk = decodeShortName(e, first == DIR_FREE, nameFirst, shortName);
-
-            if (!longName.empty() && nameIsSafe(longName)) {
-                rec.name = longName;
-            } else if (shortOk && nameIsSafe(shortName)) {
-                rec.name = shortName;
-            } else {
-                // Neither name survived: the slot is not really a directory
-                // entry, or it is too damaged to name safely.
-                ++rejected;
-                continue;
-            }
-
-            // A stale slot can hold anything. These two are what keep debris out
-            // of the listing without discarding genuinely recoverable files.
-            if (rec.size > volumeBytes_) { ++rejected; continue; }
-            if (rec.size > 0 && !validCluster(rec.firstCluster)) { ++rejected; continue; }
-            if (rec.isDir && !validCluster(rec.firstCluster)) { ++rejected; continue; }
-
-            out.push_back(std::move(rec));
-        }
+        scanEntries(buf.data(), got, clusterToOffset(cluster), lfn, pastEnd,
+                   rejected, labelOut, out);
 
         ++clustersRead;
         uint32_t next;
@@ -777,19 +920,40 @@ std::vector<FatFilesystem::Record> FatFilesystem::scanDirectory(
     return out;
 }
 
+std::vector<FatFilesystem::Record> FatFilesystem::scanFixedRoot(std::string* labelOut) {
+    std::vector<Record> out;
+    if (rootDirBytes_ == 0) return out;
+
+    std::vector<uint8_t> buf(static_cast<size_t>(rootDirBytes_));
+    size_t got = vol_->readAt(rootDirByteOffset_, buf.data(), buf.size());
+    if (got == 0) {
+        note("The root directory could not be read.");
+        return out;
+    }
+
+    std::vector<std::array<uint8_t, ENTRY_SIZE>> lfn;
+    bool pastEnd = false;
+    size_t rejected = 0;
+    scanEntries(buf.data(), got, rootDirByteOffset_, lfn, pastEnd, rejected,
+               labelOut, out);
+
+    if (rejected)
+        note("Skipped " + std::to_string(rejected) +
+             " unreadable or corrupt directory entries.");
+    return out;
+}
+
 // ----------------------------------------------------------- Filesystem API --
 
 FsNode FatFilesystem::root() {
     FsNode n;
     n.id = 0;               // the root has no directory entry to point at
-    n.name = volName_.empty() ? "FAT32 volume" : volName_;
+    n.name = volName_.empty() ? (typeName() + " volume") : volName_;
     n.isDir = true;
     return n;
 }
 
 std::vector<FsNode> FatFilesystem::listDir(const FsNode& dir) {
-    uint32_t cluster = rootCluster_;
-    bool contiguous = false;
     // Everything below a deleted folder is deleted too, whatever the child
     // entries themselves still say. Deleting a folder only marks the folder's
     // own entry - the entries *inside* it are left exactly as they were, so they
@@ -797,18 +961,22 @@ std::vector<FsNode> FatFilesystem::listDir(const FsNode& dir) {
     // folder's clusters are free space now and the user has to be told so rather
     // than shown thousands of files as if they were intact.
     bool inheritDeleted = dir.isDeleted;
-    if (dir.id != 0) {
+    std::vector<Record> records;
+    if (dir.id == 0) {
+        // The root: a cluster chain on FAT32, a fixed byte range on FAT12/16 -
+        // it never inherits "deleted" since it cannot itself be deleted.
+        records = (fatBits_ == 32) ? scanDirectory(rootCluster_, false, nullptr)
+                                   : scanFixedRoot(nullptr);
+    } else {
         auto rec = recordAt(dir.id);
         if (!rec || !rec->isDir) return {};
         if (!validCluster(rec->firstCluster)) return {};
-        cluster = rec->firstCluster;
         // Callers that rebuild an FsNode from an id alone (the CLI does) have
         // no isDeleted to pass in, so take it from the entry itself.
         inheritDeleted = inheritDeleted || rec->isDeleted;
-        contiguous = inheritDeleted;
+        records = scanDirectory(rec->firstCluster, inheritDeleted, nullptr);
     }
 
-    auto records = scanDirectory(cluster, contiguous, nullptr);
     std::vector<FsNode> out;
     out.reserve(records.size());
     for (const auto& r : records) {
@@ -887,9 +1055,10 @@ std::vector<uint8_t> FatFilesystem::readFile(const FsNode& file) {
 
 uint64_t FatFilesystem::dirIdentity(const FsNode& dir) {
     if (!dir.isDir) return 0;
-    // The root directory has no entry of its own; its cluster is the one the
-    // boot sector names.
-    if (dir.id == 0) return rootCluster_;
+    // The root directory has no entry of its own. On FAT32 its cluster is the
+    // one the boot sector names; on FAT12/16 it has no cluster at all, so a
+    // reserved sentinel stands in (see ROOT_DIR_IDENTITY).
+    if (dir.id == 0) return fatBits_ == 32 ? rootCluster_ : ROOT_DIR_IDENTITY;
     auto rec = recordAt(dir.id);
     if (!rec || !rec->isDir) return 0;
     // An empty directory can legitimately have no cluster allocated. 0 is the

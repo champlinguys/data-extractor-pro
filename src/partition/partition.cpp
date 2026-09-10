@@ -1,5 +1,6 @@
 #include "partition/partition.h"
 #include "core/byte_reader.h"
+#include "fs/fat/fat.h"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -513,14 +514,24 @@ std::vector<Partition> scanPartitions(const std::shared_ptr<ImageSource>& img,
 
     // A bare filesystem volume (image of a single partition, no partition
     // table) has an FS boot record at sector 0, which also carries the 0x55AA
-    // signature. Detect the common ones by their OEM/signature so we don't
-    // mis-parse the VBR's boot code as an MBR partition table. This is exactly
-    // the shape of a raw single-volume image (no partition table).
+    // signature. Detect the common ones so we don't mis-parse the VBR's boot
+    // code as an MBR partition table. This is exactly the shape of a raw
+    // single-volume image (no partition table) - a floppy, most notably,
+    // which is never partitioned.
+    //
+    // NTFS/BitLocker/FAT32 are recognised by their fixed OEM/signature text,
+    // but a FAT12/16 (or oddly-OEM'd FAT32) VBR has no fixed string to match -
+    // a Mac writing a PC Exchange floppy, an old DR-DOS FORMAT, or a copy
+    // protection scheme all stamp their own OEM name there. probedFatBits()
+    // instead validates the BPB's actual field shape (sector size, cluster
+    // size, FAT count, cluster count vs. width), which every real FAT volume
+    // satisfies regardless of what its OEM string says.
     bool bareVolume =
         std::memcmp(mbr.data() + 3, "NTFS    ", 8) == 0 ||  // NTFS
         std::memcmp(mbr.data() + 3, "-FVE-FS-", 8) == 0 ||  // BitLocker
         std::memcmp(mbr.data() + 3, "MSDOS", 5) == 0    ||  // FAT
-        std::memcmp(mbr.data() + 0x52, "FAT32", 5) == 0;
+        std::memcmp(mbr.data() + 0x52, "FAT32", 5) == 0 ||
+        FatFilesystem::probedFatBits(*img) != 0;
 
     if (hasSig && !bareVolume) {
         // Detect a GPT via a protective 0xEE entry anywhere in the MBR table.

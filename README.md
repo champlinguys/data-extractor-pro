@@ -127,9 +127,12 @@ Status:
   recovered by descending into deleted directories, which TSK does not do), and
   extracted files are byte-for-byte identical.
 
-  FAT12 and FAT16 are detected and labelled but not yet browsable - their root
-  directory is a fixed-size region rather than a cluster chain, and their FAT
-  entries are a different width.
+  **FAT12 and FAT16** share this same driver, including deleted-file recovery -
+  the same VFAT long names and CP437 short names - adapted for their narrower
+  FAT entries (16-bit, or packed 12-bit) and their fixed-size root directory
+  (no cluster chain, no FSInfo). Verified against a real Greaseweazle flux
+  capture of a 1.44 MB PC Exchange-formatted Mac floppy: all 30 files, plus
+  their resource forks and Finder metadata, recovered byte-for-byte.
 
 - **Apple transparent compression (decmpfs)** - working for both HFS+ and
   APFS: zlib and LZVN, stored in either the attribute or the resource fork.
@@ -347,9 +350,9 @@ filesystem parsers.
 ```
 +-----------------------------------------------------+
 | GUI (Qt5)              CLI (de-cli)                  |  front-ends
-+-----------------------------------------------------+
-| Filesystem: NTFS HFS HFS+ APFS exFAT FAT32 [ext4]   |  fs/ - browse + read
-+-----------------------------------------------------+
++-----------------------------------------------------------+
+| Filesystem: NTFS HFS HFS+ APFS exFAT FAT12/16/32 [ext4]   |  fs/ - browse + read
++-----------------------------------------------------------+
 | Partition scan: MBR / GPT / APM                     |  partition/
 +-----------------------------------------------------+
 | ImageSource: Raw | SubImage | OptaneMerge |         |  core/ - the key seam
