@@ -168,7 +168,12 @@ de-cli 'raid:mirror:/dev/sdc,/dev/sdd'        # RAID 1
 Where a set writes a descriptor of its own (the OWC Gemini keeps one in the
 last sector of each drive), the member order, set name and set size are read
 straight out of it; the rest is worked out and, either way, the result is
-checked before you rely on it. In the GUI it is
+checked before you rely on it. JMicron controllers (the JMB36x/39x inside many
+2-bay enclosures) are read the same way, stripe size and level included. If one
+member has lost its descriptor - typically because Windows offered to
+"initialize" it on its own and wrote a fresh GPT over it - it is placed in the
+slot the other members leave free, and the fresh GPT is not mistaken for the
+real disk. In the GUI it is
 **File -> Open RAID Set** (Ctrl+R), or pass the same spec on the command line:
 `data-extractor 'raid:auto:/dev/sdc,/dev/sdd'`. Reading raw drives needs root.
 

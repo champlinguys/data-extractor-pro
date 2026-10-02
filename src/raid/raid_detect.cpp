@@ -220,7 +220,16 @@ std::string lowerExt(const std::string& name) {
     return ext;
 }
 
+// The Windows Recycle Bin keeps, beside each deleted file ($Rxxxxxx.jpg), a
+// small index record named after it ($Ixxxxxx.jpg) that holds the original
+// path and deletion time - never the data its extension promises.
+bool isRecycleBinIndex(const std::string& name) {
+    return name.size() >= 8 && name[0] == '$' && name[1] == 'I' &&
+           (name.size() == 8 || name[8] == '.');
+}
+
 const std::vector<Signature>* signaturesFor(const std::string& name) {
+    if (isRecycleBinIndex(name)) return nullptr;
     std::string ext = lowerExt(name);
     if (ext.empty()) return nullptr;
     for (const auto& e : SIGNATURES)
@@ -239,9 +248,11 @@ struct ContentCheck {
 ContentCheck checkFileContents(Filesystem& fs, const FsNode& root, int wanted) {
     ContentCheck cc;
     std::function<void(const FsNode&, int)> walk = [&](const FsNode& dir, int depth) {
-        if (cc.checked >= wanted || depth > 12) return;
+        // Bounded by files seen as well as files checked: a volume of mostly
+        // unrecognised types (a Windows install) must not be walked end to end.
+        if (cc.checked >= wanted || cc.filesSeen > 20000 || depth > 12) return;
         for (const auto& n : fs.listDir(dir)) {
-            if (cc.checked >= wanted) return;
+            if (cc.checked >= wanted || cc.filesSeen > 20000) return;
             if (n.isDir) {
                 walk(n, depth + 1);
                 continue;
@@ -263,6 +274,81 @@ ContentCheck checkFileContents(Filesystem& fs, const FsNode& root, int wanted) {
     };
     walk(root, 0);
     return cc;
+}
+
+// What an NTFS volume's own structures say about the geometry beneath it.
+struct NtfsLayoutCheck {
+    uint64_t volumeBytes = 0;    // size the boot sector claims
+    bool backupBootFound = false; // the copy in the volume's last sector
+    int recordsInPlace = 0;      // MFT records whose self-number matches
+    int recordsOutOfPlace = 0;   // ...and ones that do not
+};
+
+// NTFS keeps a copy of its boot sector in the last sector of the volume, and
+// every MFT record (NTFS 3.1 on) carries its own record number. Reading a
+// megabyte of MFT crosses many stripes, so a wrong stripe size or member order
+// puts records where their numbers say they cannot be. Both checks are a few
+// reads, cheap enough for the first pass.
+NtfsLayoutCheck checkNtfsLayout(ImageSource& vol) {
+    NtfsLayoutCheck r;
+    auto boot = vol.read(0, 512);
+    if (boot.size() < 512) return r;
+    uint32_t bps = rd16(boot.data() + 0x0B);
+    uint8_t spcRaw = boot[0x0D];
+    if (bps < 256 || bps > 4096 || (bps & (bps - 1))) return r;
+    uint64_t cluster = spcRaw <= 0x80 ? static_cast<uint64_t>(spcRaw) * bps
+                                      : static_cast<uint64_t>(bps) << (256 - spcRaw);
+    if (!cluster) return r;
+    uint64_t totalSectors = rd64(boot.data() + 0x28);
+    r.volumeBytes = totalSectors * bps;
+
+    if (r.volumeBytes + bps <= vol.size()) {
+        auto backup = vol.read(r.volumeBytes, 512);
+        r.backupBootFound = backup.size() == 512 &&
+                            std::memcmp(backup.data(), boot.data(), 512) == 0;
+    }
+
+    int8_t recRaw = static_cast<int8_t>(boot[0x40]);
+    uint64_t recSize = recRaw < 0 ? (1ull << -recRaw) : static_cast<uint64_t>(recRaw) * cluster;
+    if (recSize < 512 || recSize > 65536) return r;
+    uint64_t mft = rd64(boot.data() + 0x30) * cluster;
+
+    // Only records inside the MFT's first extent are numbered by position:
+    // past it lies other data, which can hold stale MFT-like records. Record 0
+    // ($MFT itself) says how long that extent is.
+    auto rec0 = vol.read(mft, static_cast<size_t>(recSize));
+    if (rec0.size() < recSize || std::memcmp(rec0.data(), "FILE", 4) != 0) return r;
+    uint16_t usaOff = rd16(rec0.data() + 4), usaCount = rd16(rec0.data() + 6);
+    for (uint16_t k = 1; k < usaCount && usaOff + 2 * k + 2 <= recSize && k * bps <= recSize; ++k)
+        std::memcpy(rec0.data() + k * bps - 2, rec0.data() + usaOff + 2 * k, 2);
+    uint64_t extentBytes = 0;
+    for (uint32_t a = rd16(rec0.data() + 0x14); a + 0x40 < recSize;) {
+        uint32_t type = rd32(rec0.data() + a), len = rd32(rec0.data() + a + 4);
+        if (type == 0xFFFFFFFF || len < 0x18 || a + len > recSize) break;
+        if (type == 0x80 && rec0[a + 8]) {
+            const uint8_t* run = rec0.data() + a + rd16(rec0.data() + a + 0x20);
+            uint8_t lenBytes = run[0] & 0x0F;
+            uint64_t clusters = 0;
+            for (uint8_t b = 0; b < lenBytes && b < 8; ++b)
+                clusters |= static_cast<uint64_t>(run[1 + b]) << (8 * b);
+            extentBytes = std::min(clusters * cluster, rd64(rec0.data() + a + 0x30));
+            break;
+        }
+        a += len;
+    }
+    if (!extentBytes) return r;
+
+    auto buf = vol.read(mft, static_cast<size_t>(std::min<uint64_t>(extentBytes, 1u << 20)));
+    for (uint64_t i = 0; i + recSize <= buf.size(); i += recSize) {
+        const uint8_t* rec = buf.data() + i;
+        if (std::memcmp(rec, "FILE", 4) != 0) continue;
+        if (rd16(rec + 4) < 0x30) continue; // pre-3.1 record: no self-number
+        // Reserved records (16-23) are formatted but never numbered.
+        if (i && rd32(rec + 0x2C) == 0) continue;
+        if (rd32(rec + 0x2C) == i / recSize) ++r.recordsInPlace;
+        else ++r.recordsOutOfPlace;
+    }
+    return r;
 }
 
 } // namespace
@@ -341,6 +427,57 @@ MemberMetadata readMemberMetadata(ImageSource& dev) {
                 "carries an enclosure RAID descriptor in its last sector"
                 + (md.setName.empty() ? std::string()
                                       : " for the set '" + md.setName + "'"));
+            return md;
+        }
+    }
+
+    // JMicron hardware RAID (the JMB36x/39x controllers inside many 2-bay
+    // enclosures and on motherboards) keeps its descriptor in the last sector
+    // of each member. The layout is the one dmraid decodes:
+    //
+    //   0   'JM' magic, then a 16-bit version
+    //   16  this member's identity
+    //   24  sectors per member, in units of 64 Ki sectors (32-bit)
+    //   32  set name, space-padded ASCII
+    //   48  mode: 0 = RAID 0, 1 = RAID 1, 3 = JBOD
+    //   49  stripe size: 2^(n+1) sectors
+    //   64  identities of the members, in set order
+    //
+    // The 16-bit words of the first 128 bytes sum to zero, which keeps a stray
+    // 'JM' in user data from passing for one. Member data starts at sector 0.
+    if (size >= 512) {
+        auto tail = dev.read(size - 512, 512);
+        uint16_t sum = 0;
+        for (size_t i = 0; i + 1 < 128 && tail.size() >= 128; i += 2)
+            sum = static_cast<uint16_t>(sum + rd16(tail.data() + i));
+        if (tail.size() >= 512 && tail[0] == 'J' && tail[1] == 'M' && sum == 0) {
+            md.format = "JMicron RAID";
+            md.setName = fixedString(tail.data() + 32, 16);
+            while (!md.setName.empty() && md.setName.back() == ' ') md.setName.pop_back();
+            uint8_t mode = tail[48];
+            md.levelName = mode == 0 ? "RAID 0" : mode == 1 ? "RAID 1"
+                         : mode == 3 ? "JBOD" : "mode " + std::to_string(mode);
+            md.level = levelFromName(md.levelName);
+            if (mode == 0 && tail[49] < 16) md.chunkSize = 512ull << (tail[49] + 1);
+            uint32_t self = rd32(tail.data() + 16);
+            md.memberCount = 0;
+            for (int i = 0; i < 8; ++i) {
+                uint32_t id = rd32(tail.data() + 64 + 4 * i);
+                if (!id) continue;
+                if (id == self) md.memberIndex = i;
+                ++md.memberCount;
+            }
+            uint64_t perMember = static_cast<uint64_t>(rd32(tail.data() + 24)) << 16;
+            if (perMember && perMember <= size / 512 && md.memberCount > 0) {
+                uint64_t sectors = md.level == Level::Mirror
+                                       ? perMember
+                                       : perMember * static_cast<uint64_t>(md.memberCount);
+                if (sectors >= size / 512 || md.level == Level::Mirror)
+                    md.setSectors = sectors;
+            }
+            md.notes.push_back(
+                "carries a JMicron RAID descriptor in its last sector"
+                + (md.setName.empty() ? std::string() : " for the set '" + md.setName + "'"));
             return md;
         }
     }
@@ -450,6 +587,69 @@ int scoreAssembled(const std::shared_ptr<ImageSource>& disk, bool deep,
         if (NtfsFilesystem::probe(*vol)) {
             score += 3;
             ev += "NTFS volume; ";
+            auto nc = checkNtfsLayout(*vol);
+            if (nc.volumeBytes > p.lengthBytes + (1u << 20)) {
+                score -= CONTRADICTION;
+                ev += "volume claims to be bigger than the partition holding it; ";
+                continue;
+            }
+            if (nc.backupBootFound) {
+                score += 12;
+                ev += "backup boot sector at the end matches; ";
+            } else {
+                score -= CONTRADICTION;
+                ev += "backup boot sector at the end is missing or different; ";
+            }
+            if (nc.recordsOutOfPlace > 0) {
+                score -= CONTRADICTION * 2;
+                ev += std::to_string(nc.recordsOutOfPlace) +
+                      " MFT records are out of sequence - the data is "
+                      "interleaved wrong; ";
+                continue;
+            }
+            if (nc.recordsInPlace >= 32) {
+                score += 8;
+                ev += std::to_string(nc.recordsInPlace) + " MFT records in sequence; ";
+            }
+            if (!deep || deepDone) continue;
+
+            // Decisive: mount it, list the root, and check that files hold
+            // what their names say. MFT records alias under a stripe size that
+            // is a multiple of the true one; file data spread over the whole
+            // volume does not.
+            auto fs = NtfsFilesystem::open(vol);
+            if (!fs) {
+                score -= CONTRADICTION;
+                ev += "but it does not mount; ";
+                continue;
+            }
+            auto kids = fs->listDir(fs->root());
+            if (kids.empty()) {
+                score -= CONTRADICTION;
+                ev += "root directory lists nothing; ";
+                continue;
+            }
+            score += 6;
+            ev += "listed " + std::to_string(kids.size()) + " entries in the root; ";
+            auto cc = checkFileContents(*fs, fs->root(), 40);
+            if (cc.checked >= 4) {
+                if (cc.matched * 10 >= cc.checked * 9) {
+                    score += 25;
+                    verified = true;
+                    ev += std::to_string(cc.matched) + "/" + std::to_string(cc.checked) +
+                          " sampled files start with the right signature; ";
+                } else {
+                    score -= CONTRADICTION * 2;
+                    ev += "only " + std::to_string(cc.matched) + " of " +
+                          std::to_string(cc.checked) +
+                          " sampled files contain what their names say - the "
+                          "data is interleaved wrong; ";
+                }
+            } else {
+                verified = true;
+                ev += "no files of a known type to confirm the data with; ";
+            }
+            deepDone = true;
             continue;
         }
         if (HfsFilesystem::probe(*vol)) {
@@ -653,8 +853,12 @@ DetectResult detect(const std::vector<std::shared_ptr<ImageSource>>& devices,
     // Is any device already a complete disk on its own? If so this may not be
     // a RAID set at all - or it is a mirror, where each member is a full copy.
     for (size_t i = 0; i < devices.size(); ++i) {
+        // A partition table alone does not make a readable disk: Windows
+        // offering to "initialize" a lone RAID member writes a perfectly valid
+        // GPT over it. Only a filesystem that actually reads counts.
         std::string ev;
-        if (scoreAssembled(devices[i], true, &ev) >= CONFIDENT_SCORE) {
+        bool verified = false;
+        if (scoreAssembled(devices[i], true, &ev, &verified) >= CONFIDENT_SCORE && verified) {
             r.standalone.push_back(i);
             r.notes.push_back(devices[i]->name() +
                               " is a complete, readable disk on its own (" + ev + ")");
@@ -684,6 +888,44 @@ DetectResult detect(const std::vector<std::shared_ptr<ImageSource>>& devices,
             }
             seen[mi] = true;
             byIndex[mi] = i;
+        }
+        // One member without a descriptor - typically one that was wiped or
+        // re-initialised on its own - takes whichever slot the others leave
+        // free, provided they agree the set is this size.
+        if (!haveIndices) {
+            int unknown = -1, missing = -1, unknownCount = 0, freeCount = 0;
+            bool countAgrees = true;
+            for (size_t i = 0; i < devices.size(); ++i) {
+                int mi = r.metadata[i].memberIndex;
+                int mc = r.metadata[i].memberCount;
+                if (mc > 0 && mc != static_cast<int>(devices.size())) countAgrees = false;
+                if (mi < 0) { unknown = static_cast<int>(i); ++unknownCount; }
+            }
+            std::vector<bool> taken(devices.size(), false);
+            bool clash = false;
+            for (size_t i = 0; i < devices.size(); ++i) {
+                int mi = r.metadata[i].memberIndex;
+                if (mi < 0) continue;
+                if (mi >= static_cast<int>(devices.size()) || taken[mi]) clash = true;
+                else taken[mi] = true;
+            }
+            for (size_t k = 0; k < devices.size(); ++k)
+                if (!taken[k]) { missing = static_cast<int>(k); ++freeCount; }
+            if (countAgrees && !clash && unknownCount == 1 && freeCount == 1 &&
+                devices.size() > 1) {
+                std::vector<size_t> inferred(devices.size());
+                for (size_t i = 0; i < devices.size(); ++i) {
+                    int mi = r.metadata[i].memberIndex;
+                    inferred[mi < 0 ? missing : mi] = i;
+                }
+                byIndex = inferred;
+                haveIndices = true;
+                r.notes.push_back(devices[unknown]->name() +
+                                  " has no RAID descriptor of its own (it may have "
+                                  "been re-initialised); placed as member " +
+                                  std::to_string(missing + 1) +
+                                  ", the slot the others leave free");
+            }
         }
         if (haveIndices) orders.push_back(byIndex);
 
@@ -738,8 +980,8 @@ DetectResult detect(const std::vector<std::shared_ptr<ImageSource>>& devices,
                 c.score += 2;
         }
     }
-    std::sort(cands.begin(), cands.end(),
-              [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
+    std::stable_sort(cands.begin(), cands.end(),
+                     [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
 
     // Deep pass on the front-runners: actually mount and list.
     size_t deepN = std::min(opt.deepCandidates, cands.size());
@@ -749,8 +991,13 @@ DetectResult detect(const std::vector<std::shared_ptr<ImageSource>>& devices,
         cands[i].score = scoreAssembled(disk, true, &cands[i].evidence,
                                         &cands[i].fsVerified);
     }
-    std::sort(cands.begin(), cands.end(),
-              [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
+    // A geometry whose filesystem actually read beats any that did not,
+    // whatever the points say: a stray GPT is worth 18 on its own and proves
+    // nothing about the stripes behind it.
+    std::stable_sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
+        if (a.fsVerified != b.fsVerified) return a.fsVerified;
+        return a.score > b.score;
+    });
 
     r.ranked.assign(cands.begin(), cands.begin() + std::min<size_t>(cands.size(), 8));
     // Only a geometry whose filesystem we actually read counts as solved. A
@@ -759,10 +1006,14 @@ DetectResult detect(const std::vector<std::shared_ptr<ImageSource>>& devices,
     if (!cands.empty() && cands[0].score >= CONFIDENT_SCORE && cands[0].fsVerified) {
         r.assembled = true;
         r.layout = cands[0].layout;
-        r.layout.origin = r.metadata.empty() || r.metadata[0].format.empty()
+        // Any member's descriptor counts - the one that kept it need not be
+        // the drive the user happened to list first.
+        std::string format;
+        for (const auto& md : r.metadata)
+            if (!md.format.empty()) { format = md.format; break; }
+        r.layout.origin = format.empty()
                               ? "recovered by reconstruction"
-                              : (r.metadata[0].format + " metadata, verified by "
-                                                        "reconstruction");
+                              : format + " metadata, verified by reconstruction";
         r.summary = r.layout.describe() + " - " + cands[0].evidence;
         // If the runner-up scores as well as the winner, the geometry is
         // genuinely ambiguous and the user should see both.
