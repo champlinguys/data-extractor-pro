@@ -17,8 +17,8 @@ namespace de {
 // there is no B-tree and no journal, just a FAT and directories made of 32-byte
 // entry sets - which is exactly why deleted files survive on it so well.
 //
-// Nothing is held in memory except the boot parameters and the volume label:
-// directories are walked a cluster at a time and files are streamed run by run,
+// Nothing is held in memory except the boot parameters, the volume label and
+// the allocation bitmap (see below): directories are walked a cluster at a time and files are streamed run by run,
 // so a 1 TB volume opens as fast as a 1 GB one.
 //
 // Recovery-oriented extras beyond a plain reader:
@@ -31,6 +31,19 @@ namespace de {
 //   - A cluster chain that runs off into an invalid FAT entry falls back to
 //     "assume contiguous", so a file with a partly-destroyed chain still
 //     exports what it can instead of nothing.
+//   - Every deleted file is checked for having been overwritten. A deleted
+//     file only remembers where it started and how long it was, so the reader
+//     has to guess where the rest lies - and on a camera card that kept
+//     recording after the delete, the guess is often a newer clip. The first
+//     time a deleted file is listed, the live tree is walked once to map which
+//     clusters live files own (one bit per cluster: a few MB at the cluster
+//     sizes exFAT formats with); the share of a deleted file's clusters in that
+//     map is how much of its export is someone else's data.
+//     The allocation bitmap would be the cheap way to ask this, but it is the
+//     first thing to go stale on exactly the cards that come in for recovery:
+//     one Sony card here marked 2 GB in use under 100 GB of live clips, which
+//     would have shown every overwritten clip as intact. So the tree is the
+//     authority, and the bitmap is only compared against it to warn the user.
 class ExfatFilesystem : public Filesystem {
 public:
     // Returns nullptr if `vol` is not an exFAT volume.
@@ -128,6 +141,16 @@ private:
                                       uint64_t sizeBytes, bool wantSpecials,
                                       std::vector<std::vector<uint8_t>>* specials);
 
+    // Bytes of the file that are backed by clusters; past this the file reads
+    // as zeros (see streamRecord).
+    static uint64_t storedBytes(const Record& rec);
+    // FsNode::reallocatedPermille for a deleted file, measured over exactly
+    // the clusters streamRecord would read.
+    int16_t reallocatedPermille(const Record& rec);
+    // Fill liveClusters_ by walking every live entry on the volume, once.
+    void buildLiveClusterMap();
+    void markLive(const std::vector<Extent>& extents);
+
     bool streamRecord(const Record& rec, const DataSink& sink);
     void note(const std::string& msg) const;
 
@@ -143,6 +166,20 @@ private:
     uint32_t clusterCount_ = 0;
     uint32_t rootCluster_ = 0;
     uint64_t volumeBytes_ = 0;
+
+    // The allocation bitmap: bit n set means cluster n+2 is in use. Filled
+    // once at mount and read-only after, so it needs no lock. Empty when the
+    // volume has no readable bitmap. Only cross-checked, never trusted - see
+    // the class comment.
+    std::vector<uint8_t> bitmap_;
+    std::vector<Extent> bitmapExtents_;  // where the bitmap itself lives
+
+    // Clusters owned by live files, directories and the bitmap, same layout
+    // as bitmap_. Built on first use under its own lock: listing a folder of
+    // live files never pays for it.
+    std::mutex liveMutex_;
+    bool liveBuilt_ = false;
+    std::vector<uint8_t> liveClusters_;
 
     // The active FAT, read in blocks: a multi-gigabyte file is thousands of
     // chain hops, and one pread per hop is what makes a naive reader crawl.

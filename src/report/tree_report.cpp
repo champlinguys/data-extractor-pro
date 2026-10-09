@@ -93,6 +93,7 @@ std::vector<Entry> collectTree(Filesystem& fs, const FsNode& root, Stats& stats,
              e.parent = depth == 0 ? -1 : stack[depth - 1];
              e.isDir = n.isDir;
              e.isDeleted = n.isDeleted;
+             e.reallocatedPermille = n.reallocatedPermille;
              e.size = n.size;
              e.mtime = n.times.mtime;
              entries.push_back(std::move(e));
@@ -116,6 +117,8 @@ void writeTextTree(const std::vector<Entry>& entries, std::ostream& out) {
     out << "# size        modified          path\n";
     out << "# a path marked [deleted] was recovered from a freed directory "
            "entry; its data may have been partly overwritten since\n";
+    out << "# \"N% reallocated\" is how much of a deleted file's data now sits in "
+           "clusters belonging to other files (100% = nothing of it is left)\n";
     for (size_t i = 0; i < entries.size(); ++i) {
         const auto& e = entries[i];
         char buf[32];
@@ -125,9 +128,14 @@ void writeTextTree(const std::vector<Entry>& entries, std::ostream& out) {
             std::snprintf(buf, sizeof buf, "%12llu",
                           static_cast<unsigned long long>(e.size));
         std::string date = isoDate(e.mtime);
+        char mark[48] = "";
+        if (e.isDeleted && e.reallocatedPermille >= 0)
+            std::snprintf(mark, sizeof mark, "  [deleted, %.1f%% reallocated]",
+                          e.reallocatedPermille / 10.0);
+        else if (e.isDeleted)
+            std::snprintf(mark, sizeof mark, "  [deleted]");
         out << buf << "  " << (date.empty() ? std::string(16, ' ') : date) << "  "
-            << entryPath(entries, static_cast<int>(i))
-            << (e.isDeleted ? "  [deleted]" : "") << "\n";
+            << entryPath(entries, static_cast<int>(i)) << mark << "\n";
     }
 }
 
@@ -175,6 +183,9 @@ void writeHtmlTree(const std::vector<Entry>& entries, std::ostream& out,
  .path{color:#888}
  .del .nm{color:#e0a050}
  .delmark{color:#b06000;background:#2a2010;border-radius:3px;padding:0 5px;margin-left:8px;font-size:11px}
+ .del.part .nm{color:#e06050}
+ .del.gone .nm{color:#888;text-decoration:line-through}
+ .del.gone .delmark{text-decoration:none;display:inline-block}
  mark{background:#5a4a00;color:#ffd}
  .hint{color:#777;padding:10px 14px}
 </style></head><body>
@@ -187,7 +198,7 @@ void writeHtmlTree(const std::vector<Entry>& entries, std::ostream& out,
 <script>
 const N=)HTML";
 
-    // name, parent, isDir, size, mtime, isDeleted
+    // name, parent, isDir, size, mtime, isDeleted, reallocatedPermille
     out << "[";
     for (size_t i = 0; i < nodes.size(); ++i) {
         if (i) out << ",\n";
@@ -195,7 +206,8 @@ const N=)HTML";
         jsonEscape(nodes[i].name, out);
         out << "\"," << nodes[i].parent << "," << (nodes[i].isDir ? 1 : 0) << ","
             << nodes[i].size << "," << nodes[i].mtime / 1000000000 << ","
-            << (nodes[i].isDeleted ? 1 : 0) << "]";
+            << (nodes[i].isDeleted ? 1 : 0) << ","
+            << nodes[i].reallocatedPermille << "]";
     }
     out << "];\n";
 
@@ -218,6 +230,13 @@ function row(i,depth,path){
  if(n[5]){d.classList.add("del");
   const b=document.createElement("span");b.className="delmark";b.textContent=" deleted";
   b.title="Recovered from a freed directory entry - the data may have been partly overwritten since";
+  const pm=n[6];
+  if(pm==0){b.textContent=" deleted · intact";
+   b.title="Recovered from a freed directory entry; none of its clusters have been reused by another file"}
+  else if(pm>0&&pm<1000){d.classList.add("part");b.textContent=" deleted · "+(pm/10).toFixed(1)+"% overwritten";
+   b.title="That share of its clusters now belongs to other files - that part of an export is their data"}
+  else if(pm>=1000){d.classList.add("gone");b.textContent=" deleted · overwritten";
+   b.title="Every cluster it occupied now belongs to another file - an export would contain that file's data"}
   nm.appendChild(b)}
  if(path){const s=document.createElement("span");s.className="path";s.textContent="  "+path;nm.appendChild(s)}
  if(n[2])nm.onclick=()=>{open.has(i)?open.delete(i):open.add(i);render()};

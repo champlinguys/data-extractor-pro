@@ -838,12 +838,39 @@ QTreeWidgetItem* MainWindow::makeNode(const FsNode& node, int partIndex, ItemKin
     // be able to tell it apart at a glance: its contents may since have been
     // partly overwritten, and its name can collide with a live file's.
     if (node.isDeleted) {
-        item->setForeground(0, QBrush(QColor(0xB0, 0x60, 0x00)));
-        item->setToolTip(0, QString::fromStdString(node.name) +
-                            "\n\nDeleted - recovered from a directory entry whose "
-                            "in-use flag was cleared. The data may have been "
-                            "partly or wholly overwritten since; check it after "
-                            "exporting.");
+        QString tip = QString::fromStdString(node.name) +
+                      "\n\nDeleted - recovered from a directory entry whose "
+                      "in-use flag was cleared.";
+        QColor color(0xB0, 0x60, 0x00);
+        const int pm = node.reallocatedPermille;
+        if (pm < 0) {
+            tip += " The data may have been partly or wholly overwritten since; "
+                   "check it after exporting.";
+        } else if (pm == 0) {
+            tip += "\n\nNone of its clusters have been reused by another file, "
+                   "so its data is most likely intact.";
+        } else if (pm < 1000) {
+            // Red rather than amber: a partial overwrite exports cleanly and
+            // only fails when opened, so it is the case most worth flagging.
+            color = QColor(0xC0, 0x30, 0x20);
+            tip += QString("\n\n%1% of its clusters now belong to other files: "
+                           "that part of an export will be their data, not this "
+                           "file's. Video and archives usually need repair.")
+                       .arg(pm / 10.0, 0, 'f', 1);
+        } else {
+            // Wholly reused: whatever exports is another file's content under
+            // this name. Greyed and struck through so it is not mistaken for a
+            // recovery.
+            color = QColor(0x80, 0x80, 0x80);
+            QFont f = item->font(0);
+            f.setStrikeOut(true);
+            item->setFont(0, f);
+            tip += "\n\nOverwritten: every cluster it occupied now belongs to "
+                   "another file. An export would contain that file's data, not "
+                   "this one's.";
+        }
+        item->setForeground(0, QBrush(color));
+        item->setToolTip(0, tip);
     }
     item->setText(1, node.isDir ? QString() : humanSize(node.size));
     item->setText(2, QString::number(node.id));

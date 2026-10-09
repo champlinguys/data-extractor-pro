@@ -74,6 +74,23 @@ PY
 cp "$MNT/.expect_fragmented" "$SRC/fragmented.bin"
 rm -f "$MNT/.expect_fragmented"
 
+# A deleted file whose clusters are then reused - what happens to a camera card
+# that keeps recording after clips are deleted. It is deleted, then every free
+# cluster on the volume is taken by a live filler file, so the reader must
+# report it 100% reallocated. A reserve file is set aside first and freed only
+# afterwards, which leaves room for the intact deleted file below without
+# letting the filler near it. The victim lives in its own folder so the later
+# files cannot reuse its directory entry slot.
+head -c 2000000 /dev/zero > "$MNT/reserve.bin"
+mkdir -p "$MNT/victimdir"
+head -c 400000 /dev/urandom > "$MNT/victimdir/overwritten.bin"
+sync
+rm -f "$MNT/victimdir/overwritten.bin"
+sync
+dd if=/dev/zero of="$MNT/filler.bin" bs=1M status=none 2>/dev/null || true
+sync
+rm -f "$MNT/reserve.bin"
+
 # The deleted file. It is *not* copied into $SRC: it must not show up as a live
 # file, but the reader has to find it and read it back intact.
 head -c 400000 /dev/urandom > "$MNT/deleted_file.bin"
@@ -88,7 +105,7 @@ echo "== reading it back through de-cli =="
 "$CLI" "$IMG"
 
 python3 - "$CLI" "$IMG" "$SRC" "$WORK/deleted_expect.bin" <<'PY'
-import subprocess, sys, os
+import subprocess, sys, os, re
 cli, img, src, deleted_expect = sys.argv[1:5]
 
 def ls(node):
@@ -104,21 +121,23 @@ def ls(node):
         parts = rest.split(None, 1)
         size = int(parts[0])
         name = parts[1] if len(parts) > 1 else ''
-        deleted = name.endswith('(deleted)')
+        m = re.search(r'\s*\(deleted(?:, ([\d.]+)% reallocated)?\)$', name)
+        deleted = m is not None
+        realloc = float(m.group(1)) if m and m.group(1) else None
         if deleted:
-            name = name[:-len('(deleted)')].rstrip()
-        rows.append((p[0], is_dir, size, name, deleted))
+            name = name[:m.start()]
+        rows.append((p[0], is_dir, size, name, deleted, realloc))
     return rows
 
 live, dead = {}, {}
 def walk(node, prefix=''):
-    for nid, is_dir, size, name, deleted in ls(node):
+    for nid, is_dir, size, name, deleted, realloc in ls(node):
         path = prefix + name
         if is_dir:
             if not deleted:
                 walk(nid, path + '/')
         elif deleted:
-            dead[path] = (nid, size)
+            dead[path] = (nid, size, realloc)
         else:
             live[path] = (nid, size)
 walk(0)
@@ -142,7 +161,8 @@ for rel, full in sorted(expected.items()):
     if got != want:
         fails.append(f'{rel}: content differs ({len(got)} read vs {len(want)})')
 
-extra = set(live) - set(expected)
+# filler.bin exists only to take the victim's clusters; its content is zeros.
+extra = set(live) - set(expected) - {'filler.bin'}
 if extra:
     fails.append(f'unexpected live entries: {sorted(extra)[:5]}')
 
@@ -153,13 +173,24 @@ if not hit:
     fails.append('deleted_file.bin: not recovered (deleted entries: '
                  f'{sorted(dead)[:5]})')
 else:
-    nid, size = hit[0]
+    nid, size, realloc = hit[0]
+    if realloc != 0.0:
+        fails.append(f'deleted_file.bin: reported {realloc}% reallocated, '
+                     'but nothing has reused its clusters')
     got = subprocess.run([cli, img, 'cat', '1', nid], capture_output=True).stdout
     if got != want:
         fails.append(f'deleted_file.bin: content differs '
                      f'({len(got)} read vs {len(want)})')
 
-print(f'{len(expected)} live files checked, 1 deleted file, {len(fails)} failure(s)')
+# The victim: its clusters all went to filler.bin, so it must say so.
+hit = [v for k, v in dead.items() if k == 'victimdir/overwritten.bin']
+if not hit:
+    fails.append('victimdir/overwritten.bin: not listed as deleted')
+elif hit[0][2] != 100.0:
+    fails.append(f'victimdir/overwritten.bin: reported {hit[0][2]}% reallocated, '
+                 'expected 100% (every cluster was reused by filler.bin)')
+
+print(f'{len(expected)} live files checked, 2 deleted files, {len(fails)} failure(s)')
 for f in fails:
     print('  FAIL ' + f)
 sys.exit(1 if fails else 0)

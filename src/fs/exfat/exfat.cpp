@@ -2,6 +2,7 @@
 #include "core/byte_reader.h"
 #include <algorithm>
 #include <cstring>
+#include <unordered_set>
 
 namespace de {
 
@@ -283,12 +284,22 @@ void ExfatFilesystem::readRootMetadata() {
             uint64_t cap = (static_cast<uint64_t>(clusterCount_) + 7) / 8;
             len = std::min(len, cap);
             uint64_t used = 0;
-            for (const auto& ex : chainExtents(first, false, len)) {
+            bool complete = true;
+            std::vector<uint8_t> bitmap;
+            bitmap.reserve(static_cast<size_t>(len));
+            bitmapExtents_ = chainExtents(first, false, len);
+            for (const auto& ex : bitmapExtents_) {
                 std::vector<uint8_t> buf(static_cast<size_t>(ex.len));
                 size_t got = vol_->readAt(ex.off, buf.data(), buf.size());
+                if (got < buf.size()) complete = false;
                 for (size_t i = 0; i < got; ++i)
                     used += static_cast<unsigned>(__builtin_popcount(buf[i]));
+                bitmap.insert(bitmap.end(), buf.begin(), buf.end());
             }
+            // Kept to cross-check against the live tree. A hole would read as
+            // "free" and raise a false alarm, so a partly unreadable bitmap is
+            // not kept at all.
+            if (complete && bitmap.size() == len) bitmap_ = std::move(bitmap);
             stats_.usedClusters = std::min<uint64_t>(used, clusterCount_);
             break;
         }
@@ -653,6 +664,7 @@ std::vector<FsNode> ExfatFilesystem::listDir(const FsNode& dir) {
         n.isDeleted = r.isDeleted || inheritDeleted;
         n.size = r.isDir ? 0 : r.size;
         n.times = r.times;
+        if (n.isDeleted && !r.isDir) n.reallocatedPermille = reallocatedPermille(r);
         out.push_back(n);
     }
     return out;
@@ -664,15 +676,110 @@ bool ExfatFilesystem::readFileStream(const FsNode& file, const DataSink& sink) {
     return streamRecord(*rec, sink);
 }
 
-bool ExfatFilesystem::streamRecord(const Record& rec, const DataSink& sink) {
-    if (rec.isDir || rec.size == 0) return sink(nullptr, 0);
-
+uint64_t ExfatFilesystem::storedBytes(const Record& rec) {
     // Bytes past ValidDataLength were never written, so the filesystem defines
     // them as zero. Some formatters (mostly cameras) never maintain the field
     // and leave it at zero on a non-empty file; trusting it there would export
     // nothing but zeros, so in that case the data length wins.
-    uint64_t valid = rec.size;
-    if (rec.validSize > 0 && rec.validSize < rec.size) valid = rec.validSize;
+    if (rec.validSize > 0 && rec.validSize < rec.size) return rec.validSize;
+    return rec.size;
+}
+
+void ExfatFilesystem::markLive(const std::vector<Extent>& extents) {
+    for (const auto& ex : extents) {
+        uint64_t first = (ex.off - heapByteOffset_) / clusterSize_;
+        uint64_t count = (ex.len + clusterSize_ - 1) / clusterSize_;
+        for (uint64_t c = first; c < first + count && c < clusterCount_; ++c)
+            liveClusters_[c / 8] |= static_cast<uint8_t>(1u << (c % 8));
+    }
+}
+
+void ExfatFilesystem::buildLiveClusterMap() {
+    liveClusters_.assign((static_cast<size_t>(clusterCount_) + 7) / 8, 0);
+    markLive(bitmapExtents_);
+
+    // The root has no length of its own; its FAT chain says where it ends.
+    std::vector<uint32_t> seen;
+    for (uint32_t c = rootCluster_; validCluster(c) && seen.size() < clusterCount_;
+         c = fatNext(c)) {
+        if (std::find(seen.begin(), seen.end(), c) != seen.end()) break;
+        seen.push_back(c);
+        markLive({{clusterToOffset(c), clusterSize_}});
+    }
+
+    // Depth-first over live directories only: a deleted folder's clusters are
+    // free space, so whatever still looks live inside it owns nothing.
+    struct Dir { uint32_t cluster; bool noFatChain; uint64_t size; int depth; };
+    std::vector<Dir> todo{{rootCluster_, false, 0, 0}};
+    std::unordered_set<uint32_t> visited{rootCluster_};
+    while (!todo.empty()) {
+        Dir d = todo.back();
+        todo.pop_back();
+        for (const auto& r : scanDirectory(d.cluster, d.noFatChain, d.size,
+                                           false, nullptr)) {
+            if (r.isDeleted || !validCluster(r.firstCluster)) continue;
+            uint64_t bytes = r.isDir ? r.size : storedBytes(r);
+            markLive(chainExtents(r.firstCluster, r.noFatChain, bytes));
+            if (!r.isDir || d.depth + 1 >= kMaxWalkDepth) continue;
+            // A damaged volume can point two entries at one directory; walking
+            // it twice would loop forever on a cycle.
+            if (!visited.insert(r.firstCluster).second) continue;
+            todo.push_back({r.firstCluster, r.noFatChain, r.size, d.depth + 1});
+        }
+    }
+
+    // Say so when the bitmap has lost track of live data: it means the volume
+    // itself is damaged, and that any tool trusting the bitmap - including a
+    // chkdsk or a camera "repair" - would treat those files as free space.
+    if (!bitmap_.empty()) {
+        uint64_t missing = 0;
+        for (size_t i = 0; i < liveClusters_.size() && i < bitmap_.size(); ++i)
+            missing += static_cast<unsigned>(
+                __builtin_popcount(liveClusters_[i] & ~bitmap_[i]));
+        if (missing)
+            note("The allocation bitmap marks " +
+                 std::to_string(missing * clusterSize_ / (1024 * 1024)) +
+                 " MB of live files' clusters as free: the volume is damaged. "
+                 "Deleted files are checked against the directory tree "
+                 "instead, but do not write to this volume.");
+    }
+}
+
+int16_t ExfatFilesystem::reallocatedPermille(const Record& rec) {
+    {
+        std::lock_guard<std::mutex> lock(liveMutex_);
+        if (!liveBuilt_) {
+            buildLiveClusterMap();
+            liveBuilt_ = true;
+        }
+    }
+    uint64_t total = 0, inUse = 0;
+    // The same extents streamRecord reads, so the figure describes the export
+    // itself - including where a freed chain or the contiguous guess has
+    // wandered into another file's clusters.
+    for (const auto& ex : chainExtents(rec.firstCluster, rec.noFatChain,
+                                       storedBytes(rec))) {
+        uint64_t first = (ex.off - heapByteOffset_) / clusterSize_;
+        uint64_t count = (ex.len + clusterSize_ - 1) / clusterSize_;
+        for (uint64_t c = first; c < first + count; ++c) {
+            ++total;
+            uint64_t byte = c / 8;
+            if (byte < liveClusters_.size() && (liveClusters_[byte] >> (c % 8)) & 1)
+                ++inUse;
+        }
+    }
+    if (total == 0 || inUse == 0) return total == 0 ? -1 : 0;
+    if (inUse == total) return 1000;
+    // Round away from both ends: one reused cluster in thousands must not read
+    // as intact, and one surviving cluster must not read as wholly gone.
+    uint64_t pm = inUse * 1000 / total;
+    return static_cast<int16_t>(std::clamp<uint64_t>(pm, 1, 999));
+}
+
+bool ExfatFilesystem::streamRecord(const Record& rec, const DataSink& sink) {
+    if (rec.isDir || rec.size == 0) return sink(nullptr, 0);
+
+    uint64_t valid = storedBytes(rec);
 
     uint64_t written = 0;
     for (const auto& ex : chainExtents(rec.firstCluster, rec.noFatChain, valid)) {

@@ -29,6 +29,13 @@ struct FsNode {
     std::string name;
     bool isDir = false;
     bool isDeleted = false;   // recovered from an unallocated record
+    // For a deleted file: how much of the data it would export now sits in
+    // clusters the volume has since handed to something else, in tenths of a
+    // percent. 0 means none of it has been reallocated; any reuse at all is at
+    // least 1, and only a file that is wholly covered reaches 1000, so "a
+    // little" never rounds to "intact" nor "nearly all" to "all". -1 means the
+    // filesystem cannot tell (no allocation bitmap, or not checked).
+    int16_t reallocatedPermille = -1;
     uint64_t size = 0;
     FsTimes times;            // cheap timestamps captured while listing
 

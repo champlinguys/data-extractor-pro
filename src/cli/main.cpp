@@ -943,10 +943,15 @@ int main(int argc, char** argv) {
         FsNode dir = fs->root();
         if (argc >= 5) { dir.id = std::strtoull(argv[4], nullptr, 10); dir.isDir = true; }
         for (auto& c : fs->listDir(dir)) {
+            char mark[48] = "";
+            if (c.isDeleted && c.reallocatedPermille >= 0)
+                std::snprintf(mark, sizeof mark, "   (deleted, %.1f%% reallocated)",
+                              c.reallocatedPermille / 10.0);
+            else if (c.isDeleted)
+                std::snprintf(mark, sizeof mark, "   (deleted)");
             std::printf("  %-8llu %s %12llu  %s%s\n",
                         (unsigned long long)c.id, c.isDir ? "<DIR>" : "     ",
-                        (unsigned long long)c.size, c.name.c_str(),
-                        c.isDeleted ? "   (deleted)" : "");
+                        (unsigned long long)c.size, c.name.c_str(), mark);
         }
         return 0;
     }

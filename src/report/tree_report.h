@@ -39,6 +39,7 @@ struct Entry {
     int parent = -1; // index into the vector, -1 for a top-level object
     bool isDir = false;
     bool isDeleted = false;  // recovered from a freed directory entry
+    int16_t reallocatedPermille = -1;  // see FsNode
     uint64_t size = 0;
     int64_t mtime = 0;
 };
